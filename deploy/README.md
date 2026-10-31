@@ -5,6 +5,11 @@ Ship these two files to `/srv/deploy/<name>/` on the Docker server:
     deploy/docker-compose.yml     → /srv/deploy/<name>/docker-compose.yml
     deploy/centrifugo.prod.json   → /srv/deploy/<name>/centrifugo.prod.json
 
+`deploy/.env` is a working pre-filled starter — copy it too (it is
+git-ignored; real values live only on the server, rotate the marked secrets
+for prod). The compose references it explicitly (top-level `env_file`; older
+compose simply auto-loads the sibling `.env` for interpolation).
+
 Then:
 
     cp ../../.env.example .env     # fill in production values (docs/DEPLOY.md §1)

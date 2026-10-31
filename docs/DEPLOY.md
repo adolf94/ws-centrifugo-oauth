@@ -119,10 +119,18 @@ Or route **everything** through the SPA host: proxy `/connection/websocket`
 
 ## 4b · Push-based deploys via gh_webhooks (recommended)
 
-The files below are tracked in the repo under [`deploy/`](../deploy/):
-`docker-compose.yml` (the compose in this section, with healthchecks),
-`centrifugo.prod.json` (admin off, origins placeholder), and a README with the
-copy-to-server one-liners. §4b explains why the compose looks the way it does.
+Ship these files to `/srv/deploy/<name>/` on the Docker server
+(the tracked files live under [`deploy/`](../deploy/)):
+
+    deploy/docker-compose.yml     → /srv/deploy/<name>/docker-compose.yml
+    deploy/centrifugo.prod.json   → /srv/deploy/<name>/centrifugo.prod.json
+
+`deploy/.env` is a working pre-filled starter — copy it as well (git-ignored;
+rotate the marked secrets for prod). The compose references it explicitly
+(top-level `env_file`; older compose versions simply auto-load the sibling
+`.env` for `${VAR}` interpolation — same file either way). The per-service
+`environment:` maps decide what each container receives, so the trust split —
+`app` never sees the Centrifugo secrets — is unaffected.
 
 `/srv/deploy/<name>/` compose is the **prod target**; CI builds and posts. The
 `.github/workflows/deploy.yml` in this repo implements the homelab pattern:

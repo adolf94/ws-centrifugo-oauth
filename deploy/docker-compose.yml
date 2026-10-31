@@ -2,9 +2,19 @@
 # Host layout: /srv/deploy/<name>/  ← this directory's contents (compose, the
 # prod centrifugo config, and a .env made from the repo's .env.example).
 #
+# Variable source: the SIBLING `.env` (next to this file). It is referenced
+# explicitly below (top-level `env_file`; compose ≥2.24, older 2.x simply
+# auto-loads the sibling `.env` — same file either way). It feeds ${VAR}
+# interpolation ONLY; per-service `environment:` maps decide what each
+# container actually receives, so the trust split holds:
+# the `app` service never receives the Centrifugo secrets.
+#
 # Flow: GitHub Actions pushes ghcr.io/<owner>/<repo>:<sha> → gh_webhooks runs
 #   IMAGE=<sha> docker compose pull && docker compose up -d --no-deps
 #
+env_file:
+  - .env                             # also auto-loaded by older compose; explicit ≥2.24
+
 # Trust split (docs/CENTRIFUGO.md §2c): the app NEVER receives the HMAC/API
 # key; the two Centrifugo secrets live ONLY in token-issuer + centrifugo.
 # The mock auth-server does not exist in prod — the real IdP is used.
