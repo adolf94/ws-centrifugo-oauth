@@ -1,0 +1,183 @@
+# ---------------------------------------------------------------------------
+# Centrifugo real-time stack with OAuth 2.0 (JWT/JWKS) authentication
+#
+#   ┌────────────┐  WebSocket   ┌────────────────┐ JWKS fetch ┌──────────────────┐
+#   │ client/    │─────────────▶│   centrifugo   │───────────▶│ auth.adolfrey.com│
+#   │ index.html │  port 8000   │   (v6 server)  │            │  (external IdP)  │
+#   └────────────┘              └────────────────┘            └──────────────────┘
+#        │ ② authorization code + PKCE  ←→  ④ POST /realtime/authorize + /publish
+#        ▼
+#   ┌────────────┐   X-API-Key   ┌────────────────┐
+#   │  App API   │──────────────▶│ Centrifugo     │
+#   │ server/    │  /api/publish │ HTTP Server API│
+#   └────────────┘               └────────────────┘
+#
+# ---------------------------------------------------------------------------
+
+services:
+  # ------------------------------------------------------------------
+  # Real-time server (Centrifugo v6)
+  #   - WebSocket endpoint: ws://localhost:8000/connection/websocket
+  #   - HTTP Server API:    http://localhost:8000/api  (per-method: /api/<method>)
+  #   - Admin web UI:       http://localhost:8000/    (on :8000 root)
+  #   - Health:             http://localhost:8000/health
+  #   - Metrics:            http://localhost:8000/metrics
+  #
+  # CONNECTION AUTH MODE — driven by .env (MODE SWITCH section):
+  #   azure-like: the App server MINTS connection JWTs with a shared
+  #               HMAC secret (Web PubSub "client access token" pattern).
+  #   idp-jwks:   Centrifugo verifies the IdP's access tokens directly
+  #               (RS256 + issuer + audience claim checks via JWKS).
+  # config.json intentionally carries NO token settings; the mode comes
+  # entirely from env overrides. Empty env vars are treated as unset by
+  # Centrifugo, so exactly one mode is active at a time.
+  # ------------------------------------------------------------------
+  centrifugo:
+    image: centrifugo/centrifugo:v6
+    container_name: centrifugo
+    volumes:
+      # Production-style server configuration (read-only).
+      - ./centrifugo/config.json:/centrifugo/config.json:ro
+    ports:
+      - "8000:8000"
+    environment:
+      # — MODE A: azure-like brokered mode (default in .env) —
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_HMAC_SECRET:-}
+      # — MODE B: IdP-verified mode (uncomment .env overrides to activate) —
+      CENTRIFUGO_CLIENT_TOKEN_JWKS_PUBLIC_ENDPOINT: ${CENTRIFUGO_JWKS_URL_OVERRIDE:-}
+      CENTRIFUGO_CLIENT_TOKEN_ISSUER: ${CENTRIFUGO_TOKEN_ISSUER_OVERRIDE:-}
+      CENTRIFUGO_CLIENT_TOKEN_AUDIENCE: ${CENTRIFUGO_TOKEN_AUDIENCE_OVERRIDE:-}
+      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_HTTP_API_KEY:-centrifugo-api-key-local-dev-change-me}
+      CENTRIFUGO_LOG_LEVEL: ${CENTRIFUGO_LOG_LEVEL:-info}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # Sample application API (Node.js/Express). Roles:
+  #   1. OAuth authorization-code + PKCE helper:
+  #        GET  /oauth/config  — IdP metadata for the SPA login redirect
+  #        POST /oauth/token   — token/refresh exchange proxy to the IdP
+  #   2. OAuth resource server — validates the Bearer access token against
+  #      the JWKS endpoint and enforces REQUIRED_CLAIMS + REQUIRED_SCOPES
+  #      (the publisher scope URI) before the WebSocket connects:
+  #        POST /realtime/authorize
+  #   3. Publisher to Centrifugo's HTTP Server API (X-API-Key):
+  #        POST /publish       — requires scope realtime:publish
+  #   4. Static host for the browser demo client on http://localhost:3000
+  # ------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: app-api
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: ${APP_PORT:-3000}
+      # IdP endpoints + client metadata (single source of truth: .env).
+      JWKS_URL: ${AUTH_JWKS_URL:-https://auth.adolfrey.com/api/.well-known/jwks.json}
+      AUTH_ISSUER: ${AUTH_ISSUER:-https://auth.adolfrey.com/api}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-ws-server}
+      AUTH_TOKEN_URL: ${AUTH_TOKEN_URL:-https://auth.adolfrey.com/api/token}
+      AUTH_CLIENT_ID: ${AUTH_CLIENT_ID:-ws-server}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:-}
+      AUTH_SERVICE_CLIENT_ID: ${AUTH_SERVICE_CLIENT_ID:-speedtest}
+      AUTH_SERVICE_CLIENT_SECRET: ${AUTH_SERVICE_CLIENT_SECRET:-}
+      AUTH_SERVICE_SCOPES: ${AUTH_SERVICE_SCOPES:-api://ws-server/app:publisher}
+      ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS:-}
+      AUTH_REDIRECT_URI: ${AUTH_REDIRECT_URI:-http://localhost:3000/callback}
+      AUTH_REQUESTED_SCOPES: ${AUTH_REQUESTED_SCOPES:-openid profile email api://ws-server/app:publisher}
+      # REQUIRED_CLAIMS / REQUIRED_SCOPES policy — see README §2.
+      REQUIRED_CLAIMS: ${REQUIRED_CLAIMS:-sub,exp,iat,nbf,iss,aud}
+      # empty = token validation only (authN); publish scope gates publishing
+      REQUIRED_SCOPES: ${REQUIRED_SCOPES:-}
+      # Centrifugo hops ALL go through the token-issuer sidecar (mint + Server-
+      # API proxy): the app sends Bearer tokens only, never the X-API-Key.
+      # WS endpoint the SPA receives from POST /realtime/connection — swap for
+      # a gateway/proxy URL without client releases. Channel is App-managed.
+      CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL:-ws://localhost:8000/connection/websocket}
+      DEMO_CHANNEL: ${DEMO_CHANNEL:-chat}
+      # Connection-JWT mode, mirroring the Centrifugo-side MODE SWITCH in .env:
+      #   'hmac'  → azure-like: App mints connection JWTs (MODE A on Centrifugo)
+      #   'oauth' → IdP token passed through verbatim (MODE B on Centrifugo)
+      CONNECTION_TOKEN_MODE: ${CONNECTION_TOKEN_MODE:-hmac}
+      # Minting moved to the Centrifugo side: the app REQUIRES the issuer
+      # instead of holding the HMAC secret. Full endpoint of POST /realtime/token.
+      TOKEN_ISSUER_URL: ${TOKEN_ISSUER_URL:-http://token-issuer:4000/realtime/token}
+      CONNECTION_TTL: ${CONNECTION_TTL:-300}
+      SESSION_SECRET: ${SESSION_SECRET:-demo-session-secret-change-me}
+      SESSION_TTL: ${SESSION_TTL:-28800}
+    depends_on:
+      - centrifugo
+      - token-issuer
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # TOKEN-ISSUER SIDECAR — the "wall" of the Centrifugo side. It is the
+  # single holder of both Centrifugo secrets and the only OAuth-aware
+  # door in front of them:
+  #   • POST /realtime/token  — validates the publisher's OAuth token (JWKS +
+  #     claims/scopes policy) and mints the HS256 connection JWT itself, so
+  #     the app never holds the HMAC secret.
+  #   • POST /centrifugo/:method (+ sugar: /publish) — generic proxy for the
+  #     Centrifugo v6 HTTP Server API, injecting the one X-API-Key, so the
+  #     app never holds the API key either. State-changing methods require
+  #     the publish scope; read-only methods pass the base policy.
+  # No ports published: reachable inside the compose network only.
+  # ------------------------------------------------------------------
+  token-issuer:
+    build:
+      context: .
+      dockerfile: token-issuer/Dockerfile
+    container_name: token-issuer
+    environment:
+      PORT: 4000
+      # OAuth validation of the publisher (same IdP as the App server). Base
+      # admission policy: REQUIRED_SCOPES (= the publish scope URI) gates the
+      # mint AND the relayed Server-API calls.
+      JWKS_URL: ${AUTH_JWKS_URL:-https://auth.adolfrey.com/api/.well-known/jwks.json}
+      AUTH_ISSUER: ${AUTH_ISSUER:-https://auth.adolfrey.com/api}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-ws-server}
+      REQUIRED_CLAIMS: ${REQUIRED_CLAIMS:-sub,exp,iat,nbf,iss,aud}
+      REQUIRED_SCOPES: ${REQUIRED_SCOPES:-}
+      ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS:-}
+      # The minting secret + API key — only this sidecar and centrifugo
+      # receive any Centrifugo secret. The app server: none.
+      CENTRIFUGO_TOKEN_HMAC: ${CENTRIFUGO_TOKEN_HMAC_SECRET:-}
+      # Server-API proxy (single X-API-Key holder):
+      CENTRIFUGO_API_URL: http://centrifugo:8000/api
+      CENTRIFUGO_API_KEY: ${CENTRIFUGO_HTTP_API_KEY:-centrifugo-api-key-local-dev-change-me}
+      PUBLISH_REQUIRED_SCOPE: ${PUBLISH_REQUIRED_SCOPE:-api://ws-server/app:publisher}
+      ALLOWED_API_METHODS: ${ALLOWED_API_METHODS:-}
+      CONNECTION_TTL: ${CONNECTION_TTL:-300}
+      # Bundle contents returned (and relayed to the SPA by the App server):
+      CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL:-ws://localhost:8000/connection/websocket}
+      DEMO_CHANNEL: ${DEMO_CHANNEL:-chat}
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # OPTIONAL mock OAuth 2.0 authorization server (offline lab fallback).
+  # Comment out or `docker compose stop auth-server` when using only the
+  # real IdP; to demo the full flow offline temporarily .env-override:
+  #   AUTH_ISSUER=https://auth.example.com/realms/demo
+  #   AUTH_AUDIENCE=centrifugo
+  #   AUTH_JWKS_URL=http://auth-server:9001/realms/demo/.well-known/jwks.json
+  # ------------------------------------------------------------------
+  auth-server:
+    build:
+      context: ./auth-server
+    container_name: auth-server
+    ports:
+      - "9001:9001"
+    environment:
+      PORT: ${AUTH_PORT:-9001}
+      KEYS_DIR: /app/keys
+    volumes:
+      - auth-keys:/app/keys
+    restart: unless-stopped
+
+volumes:
+  auth-keys:

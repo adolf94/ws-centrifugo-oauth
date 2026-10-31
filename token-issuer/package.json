@@ -1,0 +1,18 @@
+{
+  "name": "centrifugo-token-issuer",
+  "version": "1.0.0",
+  "description": "Mint-issuer sidecar (Centrifugo side): validates publishers via OAuth (JWKS) and mints Centrifugo connection JWTs — the app server never holds the HMAC secret",
+  "private": true,
+  "license": "MIT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "jose": "^5.9.6"
+  }
+}

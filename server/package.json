@@ -1,0 +1,18 @@
+{
+  "name": "centrifugo-oauth-app-api",
+  "version": "1.0.0",
+  "description": "Sample app API: OAuth 2.0 resource server (JWKS) + Centrifugo HTTP API publisher + demo client host",
+  "private": true,
+  "license": "MIT",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "jose": "^5.9.6"
+  }
+}

@@ -1,0 +1,22 @@
+# --- secrets & local state ------------------------------------------------------
+.env
+node_modules/
+dist/
+build/
+out/
+coverage/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# --- tooling / editor -----------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- docker / runtime -----------------------------------------------------------
+auth-keys/
+data/
+tmp/

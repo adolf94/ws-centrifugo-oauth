@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Centrifugo × OAuth 2.0 (JWKS) — real-time demo</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel: #1e293b; --line: #334155; --text: #e2e8f0;
+      --muted: #94a3b8; --accent: #38bdf8; --ok: #4ade80; --err: #f87171; --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+           background: var(--bg); color: var(--text); }
+    header { padding: 18px 24px; border-bottom: 1px solid var(--line); }
+    header h1 { margin: 0 0 4px; font-size: 18px; }
+    header p { margin: 0; color: var(--muted); font-size: 12px; }
+    main { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px 24px; max-width: 1400px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+    .card h2 { margin: 0 0 10px; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); }
+    button { display: block; width: 100%; margin: 6px 0; padding: 9px 12px; font: inherit; font-size: 13px;
+             color: var(--text); background: #0b1220; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; text-align: left; }
+    button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    button.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err); }
+    label { display: block; font-size: 11px; color: var(--muted); margin: 10px 0 4px; text-transform: uppercase; letter-spacing: .06em; }
+    input[type=text] { width: 100%; padding: 8px 10px; font: inherit; font-size: 13px; color: var(--text);
+                       background: #0b1220; border: 1px solid var(--line); border-radius: 8px; }
+    .status { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 13px; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+    .dot.connecting { background: var(--warn); } .dot.connected { background: var(--ok); }
+    .dot.disconnected { background: var(--err); }
+    .log { height: 430px; overflow-y: auto; font-size: 12px; line-height: 1.55; }
+    .log div { padding: 2px 0; border-bottom: 1px dashed var(--line); white-space: pre-wrap; word-break: break-word; }
+    .log .t { color: var(--muted); }
+    .log .ok { color: var(--ok); } .log .err { color: var(--err); } .log .warn { color: var(--warn); }
+    .log .msg { color: var(--accent); }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px;
+            border: 1px solid var(--line); color: var(--muted); margin: 2px 4px 2px 0; }
+    .pill.ok { color: var(--ok); border-color: var(--ok); }
+    .pill.err { color: var(--err); border-color: var(--err); }
+    #tokenBox { margin-top: 8px; max-height: 150px; overflow-y: auto; word-break: break-all; font-size: 11px; color: var(--muted); }
+    code { color: var(--ok); }
+    .hint { font-size: 11px; color: var(--muted); margin: 6px 0 0; }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Centrifugo × OAuth 2.0 (JWT / JWKS) — real-time demo</h1>
+  <p>authorization code + PKCE → access token → backend scope gate → WebSocket &amp; live publications</p>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>1&middot; OAuth login <span id="iam" class="pill"></span></h2>
+      <p class="hint" id="iamHint">loading IdP metadata from /oauth/config…</p>
+      <button id="btnLogin">Login (authorization code + PKCE)</button>
+      <label>Negative path (watch-only: can connect, publish → 403)</label>
+      <button id="btnLoginBad" class="danger">Login WITHOUT the publisher scope</button>
+      <label>Offline lab login only — the IdP-only sidecar refuses it for WS/publish</label>
+      <button id="btnSession">App session login → (no token-issuer path; expected 403)</button>
+      <button id="btnSessionLogout" class="danger">Clear app session / OAuth tokens</button>
+      <div id="tokenBox"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>2&middot; Backend scope gate (resource server)</h2>
+      <p style="font-size:11px;color:var(--muted);margin:0 0 8px">
+        The App API validates the token against the IdP's JWKS endpoint and enforces
+        <code>required_claims</code> + <code>required_scopes</code> (<span id="scopesHint"></span>).
+        Centrifugo re-verifies the same JWT independently (JWKS + iss + aud + exp + sub).
+      </p>
+      <button id="btnAuthorize" disabled>POST /realtime/authorize — validate Bearer token (gate only)</button>
+      <div id="authResult" style="margin-top:10px;font-size:12px;min-height:20px"></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>3&middot; WebSocket</h2>
+      <button id="btnConnect" disabled>Request WS URL + JWT from App API → connect</button>
+      <button id="btnConnectAnyway" class="danger" disabled>(advanced) Connect ignoring the app gate</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+      <div class="status"><span class="dot" id="dot"></span><span id="state">disconnected</span></div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>4&middot; Publish (via App API → Centrifugo HTTP API)</h2>
+      <label for="msgText">Message</label>
+      <input type="text" id="msgText" placeholder="hello real-time world" />
+      <button id="btnPublish" disabled>POST /publish (X-API-Key → Centrifugo /api/publish)</button>
+      <p class="hint">requires OAuth scope <code id="publishScopeHint"></code> on the publishing identity</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>Live log — channel <code>chat</code></h2>
+      <div class="log" id="log"></div>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/centrifuge@5.4.0/dist/centrifuge.min.js"></script>
+<script>
+(() => {
+  // ---------------------------------------------------------------------
+  // IdP metadata arrives from the App API (single source of truth: .env):
+  //   authorization_endpoint, client_id (ws-server), redirect_uri, scopes…
+  // The raw access token (RS256 JWT, aud=ws-server) is used VERBATIM as the
+  // Centrifugo connection JWT; Centrifugo verifies signature + iss + aud via
+  // the IdP's JWKS endpoint configured in centrifugo/config.json.
+  // ---------------------------------------------------------------------
+  const APP_API_URL = window.location.origin;          // http://localhost:3000
+  const FALLBACK_WS = 'ws://localhost:8000/connection/websocket'; // only for the (advanced) bypass test
+  const DEFAULT_CHANNEL = 'chat';
+  const REQUIRED_SCOPES_HINT = 'none — token validation only (publish requires api://ws-server/app:publisher)';
+  const PUBLISH_SCOPE_HINT = 'api://ws-server/app:publisher';
+
+  const $ = (id) => document.getElementById(id);
+  $('scopesHint').innerText = REQUIRED_SCOPES_HINT;
+  $('publishScopeHint').innerText = PUBLISH_SCOPE_HINT;
+
+  const dot = $('dot'), state = $('state');
+
+  let CENTRIFUGE = null;
+  let SUB = null;
+  let accessToken = null;
+  let refreshToken = null;
+  let iam = null; // OIDC metadata from /oauth/config
+  let conn = null; // connection bundle from POST /realtime/connection {url, token, channel, …}
+
+  function log(text, cls = '') {
+    const el = document.createElement('div');
+    const t = new Date().toLocaleTimeString();
+    const span = document.createElement('span');
+    span.className = cls;
+    span.textContent = `[${t}] ${typeof text === 'string' ? text : JSON.stringify(text)}`;
+    el.appendChild(span);
+    $('log').appendChild(el);
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+  function pretty(v) { return typeof v === 'string' ? v : JSON.stringify(v); }
+
+  /** Decode a JWT payload purely for display (no signature check!). */
+  function decodeJwt(token) {
+    try {
+      const [, payloadB64] = token.split('.');
+      return JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+    } catch { return null; }
+  }
+
+  async function initOam() {
+    const res = await fetch(`${APP_API_URL}/oauth/config`);
+    iam = await res.json();
+    $('iam').textContent = `client_id ${iam.client_id}`;
+    $('iamHint').innerHTML =
+      `authorize: <code>${iam.authorization_endpoint}</code><br/>` +
+      `scopes: <span class="pill">${iam.scopes.join('</span><span class="pill">')}</span>`;
+  }
+
+  // -------------------------------------------------------------------
+  // 1) Authorization code + PKCE against the real IdP
+  // -------------------------------------------------------------------
+  function base64url(buf) {
+    return btoa(String.fromCharCode(...new Uint8Array(buf)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  async function pkce() {
+    const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+    return { verifier, challenge: base64url(digest) };
+  }
+  function startLogin(grantedScopes) {
+    return (async () => {
+      const state = base64url(crypto.getRandomValues(new Uint8Array(16)));
+      const { verifier, challenge } = await pkce();
+      sessionStorage.setItem('pkce_verifier', verifier);
+      sessionStorage.setItem('oauth_state', state);
+      const url = new URL(iam.authorization_endpoint);
+      url.searchParams.set('response_type', iam.response_type);        // code
+      url.searchParams.set('client_id', iam.client_id);                // ws-server
+      url.searchParams.set('redirect_uri', iam.redirect_uri);
+      url.searchParams.set('scope', grantedScopes.join(' '));
+      url.searchParams.set('state', state);
+      url.searchParams.set('code_challenge', challenge);
+      url.searchParams.set('code_challenge_method', iam.code_challenge_method); // S256
+      log(`redirecting to IdP (${grantedScopes.length} requested scopes)…`);
+      window.location.href = url.toString();
+    })();
+  }
+  $('btnLogin').onclick = () => startLogin(iam.scopes);
+  // negative test: ask for scopes WITHOUT the feature scopes (connect + publish)
+  $('btnLoginBad').onclick = () =>
+    startLogin(iam.scopes.filter((s) => !s.startsWith('realtime:') && !s.startsWith('api://')));
+
+  /** App-level login (no OAuth): POST /session/demo → cookie → bundle */
+  $('btnSession').onclick = async () => {
+    const res = await fetch(`${APP_API_URL}/session/demo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user: $('userId').value || '42' }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) return log(`session login failed (${res.status}): ${pretty(body)}`, 'err');
+    log(`app-level session started for "${body.user}" (cookie, ${body.expires_in}s) — IdP not involved`, 'ok');
+    accessToken = null; refreshToken = null;
+    $('tokenBox').textContent = '(app session cookie — no OAuth token)';
+    $('btnAuthorize').disabled = true; // authorize endpoint is the OAuth demo path
+    $('btnConnectAnyway').disabled = false;
+  };
+  $('btnSessionLogout').onclick = async () => {
+    await fetch(`${APP_API_URL}/session/logout`, { method: 'POST' });
+    sessionStorage.removeItem('access_token'); sessionStorage.removeItem('refresh_token');
+    accessToken = null; refreshToken = null;
+    setState('disconnected', 'logged out');
+    log('session cleared', 'warn');
+  };
+
+  /** Handle the IdP redirect on /callback. */
+  async function handleCallback() {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const st = params.get('state');
+    const err = params.get('error');
+    if (err) {
+      return log(`IdP login error: ${err} — ${params.get('error_description') || ''}`, 'err');
+    }
+    if (!code || !st) return;
+    if (st !== sessionStorage.getItem('oauth_state')) {
+      return log('state mismatch — aborting (possible CSRF)', 'err');
+    }
+    const verifier = sessionStorage.getItem('pkce_verifier');
+    history.replaceState({}, 'demo', '/callback'); // clean the URL bar
+    log('exchanging authorization code (PKCE) via POST /oauth/token…');
+    const res = await fetch(`${APP_API_URL}/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        grant_type: 'authorization_code',
+        code,
+        code_verifier: verifier,
+      }),
+    });
+    const body = await res.json();
+    if (!res.ok) return log(`token exchange failed (${res.status}): ${pretty(body)}`, 'err');
+    storeTokens(body);
+  }
+
+  function storeTokens(body) {
+    accessToken = body.access_token;
+    refreshToken = body.refresh_token || null;
+    sessionStorage.setItem('access_token', accessToken);
+    if (refreshToken) sessionStorage.setItem('refresh_token', refreshToken);
+    $('tokenBox').textContent = accessToken;
+    const claims = decodeJwt(accessToken);
+    log(`access token obtained: sub="${claims?.sub}" iss="${claims?.iss}" aud="${claims?.aud}" scope="${claims?.scope}"`, 'ok');
+    $('btnAuthorize').disabled = false;
+    $('btnConnectAnyway').disabled = false;
+  }
+
+  // -------------------------------------------------------------------
+  // 2) ask the App API for the WS URL + connection token → 3) connect
+  // -------------------------------------------------------------------
+  async function authorizeAndConnect() {
+    const res = await fetch(`${APP_API_URL}/realtime/connection`, {
+      method: 'POST',
+      headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      log(`connection request REJECTED (${res.status}): ${pretty(body)}`, 'err');
+      if (body.problems) log(`problems: ${body.problems.join('; ')}`, 'err');
+      $('authResult').innerHTML =
+        `<span class="pill err">${res.status}</span> <code>${pretty(body.error || body)}</code>`;
+      return;
+    }
+    conn = body.connection;
+    $('authResult').innerHTML =
+      `<span class="pill ok">200 OK</span><span class="pill">subject ${pretty(conn.subject)}</span>` +
+      `<span class="pill">${pretty(body.claims.granted_scopes.join(' '))}</span>` +
+      `<span class="pill">ttl ${conn.expires_in}s</span>`;
+    log(`App API says: WebSocket ${conn.url} · channel ${conn.channel} · connection JWT valid ${conn.expires_in}s`, 'ok');
+    startBaseConnection(conn);
+  }
+  $('btnAuthorize').onclick = authorizeAndConnect;
+  // Main flow: request connection bundle from the App server → open the WS.
+  $('btnConnect').onclick = authorizeAndConnect;
+
+  function startBaseConnection(c = { url: FALLBACK_WS, token: accessToken, channel: DEFAULT_CHANNEL }) {
+    CENTRIFUGE = new Centrifuge(c.url, {
+      token: c.token, // OAuth access token == Centrifugo connection JWT
+      // Automatic refresh when the token's exp is reached. Prefer the
+      // refresh_token grant; fall back to a brand-new authorization flow.
+      getToken: async (ctx) => {
+        log(`connection refresh (${ctx?.reason ?? 'init'}): refreshing access token…`, 'warn');
+        if (refreshToken) {
+          const res = await fetch(`${APP_API_URL}/oauth/token`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+          });
+          const body = await res.json();
+          if (!res.ok) throw new Error(`refresh failed: ${pretty(body)}`);
+          storeTokens(body);
+          return accessToken;
+        }
+        return startLogin(iam.scopes);
+      },
+    });
+
+    CENTRIFUGE.on('connecting', (ctx) => setState('connecting', `connecting: ${ctx.reason} / ${ctx.code}`));
+    CENTRIFUGE.on('connected', (ctx) => {
+      setState('connected', `connected (client ${ctx.client} · user ${ctx.user})`);
+      listen();
+    });
+    CENTRIFUGE.on('disconnected', (ctx) => setState('disconnected', `disconnected: ${ctx.reason} / ${ctx.code}`));
+    CENTRIFUGE.on('error', (ctx) => log(`centrifuge error: ${pretty(ctx.error || ctx)}`, 'err'));
+
+    CENTRIFUGE.connect();
+    log(`connecting to ${c.url} with the OAuth access token as connection JWT…`);
+  }
+
+  // (advanced) honest negative test — Centrifugo's own checks are:
+  //   signature (IdP JWKS) + iss + aud + exp + non-empty "sub". Custom OAuth
+  //   scopes are NOT evaluated by the Centrifugo server itself (README §2),
+  //   so a valid-signature token lacking realtime:connect can still connect
+  //   when the client bypasses the backend gate. Hardening options: mint
+  //   Centrifugo-specific JWTs server-side / connect proxy / Centrifugo PRO.
+  $('btnConnectAnyway').onclick = () => {
+    if (!accessToken) { log('log in first (step 1)', 'warn'); return; }
+    log('bypassing the backend gate and connecting directly to Centrifugo…', 'warn');
+    startBaseConnection({ url: FALLBACK_WS, token: accessToken, channel: DEFAULT_CHANNEL });
+  };
+
+  function listen() {
+    SUB = CENTRIFUGE.subscribe(c.channel);
+    SUB.on('subscribed', () => { log(`subscribed: ${c.channel}`, 'ok'); $('btnPublish').disabled = false; });
+    SUB.on('publication', (ctx) => log(`publication: ${pretty(ctx.data)}`, 'msg'));
+    SUB.on('join', (ctx) => log(`join: ${pretty(ctx.info?.user)}`, 'ok'));
+    SUB.on('leave', (ctx) => log(`leave: ${pretty(ctx.info?.user)}`, 'warn'));
+    SUB.on('error', (ctx) => log(`subscribe error: ${pretty(ctx.error)}`, 'err'));
+  }
+
+  // -------------------------------------------------------------------
+  // 4) publish: App API → Centrifugo HTTP Server API (X-API-Key)
+  // -------------------------------------------------------------------
+  $('btnPublish').onclick = async () => {
+    if (!accessToken) { log('not authenticated', 'warn'); return; }
+    const res = await fetch(`${APP_API_URL}/publish`, {
+      method: 'POST',
+      headers: accessToken
+        ? { 'Content-Type': 'application/json', Authorization: `Bearer ${accessToken}` }
+        : { 'Content-Type': 'application/json' }, // session cookie flows implicitly
+      body: JSON.stringify({ message: $('msgText').value }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) { log(`publish rejected (${res.status}): ${pretty(body)}`, 'err'); return; }
+    log(`App API accepted publish for ${conn?.channel ?? DEFAULT_CHANNEL} → delivered via Centrifugo /api/publish`, 'ok');
+  };
+
+  $('btnDisconnect').onclick = () => {
+    if (CENTRIFUGE) { CENTRIFUGE.disconnect(); CENTRIFUGE = null; SUB = null; }
+  };
+
+  function setState(kind, text) {
+    dot.className = `dot ${kind}`;
+    state.textContent = text;
+    $('btnAuthorize').disabled = !accessToken;
+    $('btnConnectAnyway').disabled = !accessToken || kind === 'connected';
+    $('btnDisconnect').disabled = kind !== 'connected';
+    $('btnPublish').disabled = kind !== 'connected';
+  }
+
+  // -------------------------------------------------------------------
+  // boot: IdP metadata → auth code (on /callback) → session token
+  // -------------------------------------------------------------------
+  (async () => {
+    log(`WS endpoint + connection JWT come from the App API (POST /realtime/connection) · required scope: ${REQUIRED_SCOPES_HINT}`);
+    if (!window.Centrifuge) return log('centrifuge-js failed to load from CDN', 'err');
+    await initOam();
+    const stored = sessionStorage.getItem('access_token');
+    if (stored) { accessToken = stored; refreshToken = sessionStorage.getItem('refresh_token'); setState('disconnected', 'restored session — press “validate Bearer token” to reconnect'); }
+    if (window.location.pathname === '/callback') {
+      await handleCallback();
+    } else if (!accessToken) {
+      log(`log in via ${iam ? iam.authorization_endpoint : 'the IdP'} (authorization code + PKCE)`);
+    }
+  })();
+})();
+</script>
+</body>
+</html>
+

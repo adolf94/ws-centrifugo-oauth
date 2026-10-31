@@ -1,0 +1,38 @@
+{
+  "http_server": {
+    "port": 8000
+  },
+  "log": {
+    "level": "info"
+  },
+  "client": {
+    "allowed_origins": [
+      "http://localhost:3000",
+      "https://*.your-app.example.com"
+    ],
+    "disallow_anonymous_connection_tokens": true
+    ,
+    "token": {}
+  },
+  "http_api": {
+    "key": "centrifugo-api-key-local-dev-change-me"
+  },
+  "channel": {
+    "without_namespace": {
+      "allow_subscribe_for_client": true,
+      "presence": true,
+      "join_leave": true
+    }
+  },
+  "admin": {
+    "enabled": true,
+    "password": "centrifugo-admin-local-dev-change-me",
+    "secret": "centrifugo-admin-secret-local-dev-change-me"
+  },
+  "health": {
+    "enabled": true
+  },
+  "prometheus": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,133 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 950" font-family="DejaVu Sans, Segoe UI, Arial, sans-serif">
+  <!-- ============================================================
+       Corrected version of viz/Untitled-2026-10-31-1417.svg (Excalidraw sketch)
+       Same four lifelines (SPA · Auth · App(speedtest) · WS(ws-server)),
+       flows fixed to match the implemented stack:
+         - WS never issues ws-urls (the App server composes them from config)
+         - connection JWT = user token (sub!) from ws-server PKCE login
+         - speedtest token (client_credentials) = publisher lane only
+       ============================================================ -->
+  <defs>
+    <marker id="mBlue"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+    <marker id="mGreen"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#047857"/></marker>
+    <marker id="mOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b45309"/></marker>
+    <marker id="mRed"    viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#b91c1c"/></marker>
+    <marker id="mViolet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#6d28d9"/></marker>
+    <marker id="mGray"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#64748b"/></marker>
+  </defs>
+  <style>
+    .bg{fill:#fdfdfb;}
+    .lane{stroke:#9a9a9a;stroke-width:1.2;stroke-dasharray:5 4;}
+    .actorT{font-size:15px;font-weight:700;fill:#1e1e1e;}
+    .actorS{font-size:11px;fill:#5f6b7a;}
+    .lbl{font-size:11.5px;fill:#1e1e1e;paint-order:stroke;stroke:#fdfdfb;stroke-width:4px;stroke-linejoin:round;}
+    .sub{font-size:10px;fill:#5f6b7a;paint-order:stroke;stroke:#fdfdfb;stroke-width:4px;stroke-linejoin:round;}
+    .ppt{font-size:10px;fill:#b91c1c;paint-order:stroke;stroke:#fdfdfb;stroke-width:4px;stroke-linejoin:round;font-style:italic;}
+    .h{font-size:15px;font-weight:800;fill:#1e1e1e;}
+    .leg{font-size:11px;fill:#334155;}
+  </style>
+
+  <rect class="bg" width="760" height="950" rx="10"/>
+  <text class="h" x="22" y="30">Your sketch, corrected to match the implementation</text>
+  <text class="sub" x="22" y="47">same lifelines as viz/Untitled-2026-10-31-1417.svg — 2 assumptions fixed (red notes): the WS never sells ws-urls, and connection JWTs must carry a user (speedtest tokens are publisher-only)</text>
+
+  <!-- lifelines -->
+  <line class="lane" x1="60"  y1="86" x2="60"  y2="800"/>
+  <line class="lane" x1="260" y1="86" x2="260" y2="800"/>
+  <line class="lane" x1="470" y1="86" x2="470" y2="800"/>
+  <line class="lane" x1="690" y1="86" x2="690" y2="800"/>
+
+  <text class="actorT" x="60"  y="80" text-anchor="middle">SPA</text>
+  <text class="actorT" x="260" y="80" text-anchor="middle">AUTH</text>
+  <text class="actorT" x="470" y="73" text-anchor="middle">APP</text>
+  <text class="actorS" x="470" y="87" text-anchor="middle">client_id: speedtest (M2M)</text>
+  <text class="actorT" x="690" y="73" text-anchor="middle">WS (Centrifugo)</text>
+  <text class="actorS" x="690" y="87" text-anchor="middle">verifier only · aud: ws-server</text>
+
+  <!-- ═══ 1 · login (browser PKCE flow — client = ws-server) ═══ -->
+  <text class="sub" fill="#2563eb" x="22" y="115" font-weight="700">1 · LOGIN — ws-server client (SPA), code + PKCE</text>
+
+  <line x1="65" y1="135" x2="252" y2="135" stroke="#2563eb" stroke-width="1.8" marker-end="url(#mBlue)"/>
+  <text class="lbl" x="158" y="129" text-anchor="middle">① GET /authorize</text>
+  <text class="sub" x="158" y="141" text-anchor="middle">client_id=ws-server · code · PKCE S256</text>
+
+  <line x1="252" y1="165" x2="68" y2="165" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#mBlue)"/>
+  <text class="lbl" x="158" y="160" text-anchor="middle">② code → /callback?code=…</text>
+
+  <line x1="65" y1="192" x2="462" y2="192" stroke="#2563eb" stroke-width="1.8" marker-end="url(#mBlue)"/>
+  <text class="lbl" x="266" y="186" text-anchor="middle">③ POST /oauth/token {code, code_verifier}</text>
+
+  <line x1="474" y1="219" x2="268" y2="219" stroke="#2563eb" stroke-width="1.8" marker-end="url(#mBlue)"/>
+  <text class="sub" x="371" y="213" text-anchor="middle">exchange code</text>
+  <line x1="474" y1="243" x2="268" y2="243" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#mBlue)"/>
+  <text class="sub" x="371" y="237" text-anchor="middle">⇠ token: aud=ws-server · sub=&lt;user&gt; · scope realtime:*</text>
+  <line x1="466" y1="266" x2="68" y2="266" stroke="#2563eb" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#mBlue)"/>
+  <text class="lbl" x="266" y="261" text-anchor="middle">④ access_token + refresh_token (kept in the SPA)</text>
+
+  <!-- gate note -->
+  <text class="ppt" x="365" y="297" text-anchor="middle">✎ your sketch said "request token for speedtest" here — the SPA acts as the ws-server client instead</text>
+
+  <!-- ═══ 2 · connection ═══ -->
+  <text class="sub" fill="#047857" x="22" y="325" font-weight="700">2 · SUBSCRIBE — app server gates &amp; hands out URL + token</text>
+
+  <line x1="65" y1="347" x2="462" y2="347" stroke="#047857" stroke-width="1.8" marker-end="url(#mGreen)"/>
+  <text class="lbl" x="266" y="341" text-anchor="middle">⑤ POST /realtime/connection (Bearer user JWT)</text>
+  <text class="sub" x="266" y="354" text-anchor="middle">policy: signature via JWKS · iss · aud=ws-server · claims sub,exp,iat,nbf · scope realtime:connect</text>
+
+  <text class="ppt" x="580" y="383" text-anchor="middle">✎ no call to WS here — the App composes the url from its config</text>
+  <text class="sub" x="580" y="380" text-anchor="middle" display="none"/>
+  <line x1="462" y1="407" x2="68" y2="407" stroke="#047857" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#mGreen)"/>
+  <text class="lbl" x="266" y="402" text-anchor="middle">⑥ {url: ws://…/connection/websocket, token, channel:"chat", expires_in}</text>
+
+  <line x1="695" y1="437" x2="690" y2="437" stroke="#64748b" stroke-width="1.4" display="none"/>
+  <line x1="474" y1="440" x2="682" y2="440" stroke="#64748b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#mGray)"/>
+  <text class="sub" x="580" y="434" text-anchor="middle">⑦ GET /.well-known/jwks.json — public keys only (cached 5 min)</text>
+
+  <line x1="65" y1="470" x2="682" y2="470" stroke="#047857" stroke-width="2" marker-end="url(#mGreen)"/>
+  <text class="lbl" x="373" y="464" text-anchor="middle">⑧ connect {token} → verified signature/iss/aud/exp/sub → subscribed("chat")</text>
+
+  <!-- ═══ 3 · publish (speedtest lane) ═══ -->
+  <text class="sub" fill="#b45309" x="22" y="503" font-weight="700">3 · PUBLISH — the speedtest token's real job</text>
+
+  <line x1="474" y1="527" x2="268" y2="527" stroke="#b45309" stroke-width="1.8" marker-end="url(#mOrange)"/>
+  <text class="lbl" x="371" y="522" text-anchor="middle">⑨ POST /token — grant_type=client_credentials (client_id=speedtest)</text>
+  <line x1="268" y1="553" x2="474" y2="553" stroke="#b45309" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#mOrange)"/>
+  <text class="sub" x="371" y="548" text-anchor="middle">⇠ service token (cached until exp−60s)</text>
+
+  <text class="ppt" x="366" y="580" text-anchor="middle">✎ this token is PUBLISHER-only — it has no user (sub), so Centrifugo would refuse it to CONNECT</text>
+
+  <line x1="474" y1="605" x2="682" y2="605" stroke="#b45309" stroke-width="2" marker-end="url(#mOrange)"/>
+  <text class="lbl" x="578" y="600" text-anchor="middle">⑩ POST /api/publish {channel,data}</text>
+  <text class="sub" x="578" y="612" text-anchor="middle">X-API-Key (http_api.key — internal trust, not OAuth)</text>
+
+  <line x1="682" y1="645" x2="68" y2="645" stroke="#6d28d9" stroke-width="1.8" stroke-dasharray="5 4" marker-end="url(#mViolet)"/>
+  <text class="lbl" x="373" y="640" text-anchor="middle">⑪ fan-out push { channel:"chat", pub:{data} } → every connected SPA tab</text>
+
+  <!-- keep-alive -->
+  <text class="sub" fill="#047857" x="22" y="676" font-weight="700">4 · KEEP-ALIVE — refresh through the same proxy</text>
+  <line x1="65" y1="700" x2="462" y2="700" stroke="#047857" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#mGreen)"/>
+  <text class="sub" x="266" y="695" text-anchor="middle">⑫ POST /oauth/token {grant_type:"refresh_token"} on exp — Centrifugo keeps/extends the WS</text>
+
+  <!-- summary panel -->
+  <g transform="translate(20,730)">
+    <rect width="720" height="200" fill="#ffffff" stroke="#cbd5e1" rx="10"/>
+    <text class="h" x="16" y="26" font-size="12px">What changed vs. your sketch — and why</text>
+    <text class="leg" x="16"  y="50">1. "request ws url → WS responds"  ➜  <tspan font-weight="700" fill="#b91c1c">deleted</tspan>: Centrifugo has no URL API. The address is App-server config</text>
+    <text class="leg" x="36"  y="66">(CENTRIFUGO_PUBLIC_WS_URL) and is handed to the SPA together with the connection JWT (step ⑥).</text>
+    <text class="leg" x="16"  y="90">2. "speedtest requests token FOR ws-server, SPA connects with it"  ➜  <tspan font-weight="700" fill="#b91c1c">split</tspan>: tokens are identity-bound</text>
+    <text class="leg" x="36"  y="106">• connection JWT  = user token (sub=&lt;user&gt;) issued to <tspan font-weight="700">ws-server</tspan> (PKCE login) — aud=ws-server</text>
+    <text class="leg" x="36"  y="122">• publisher token = service token (no sub) issued to <tspan font-weight="700">speedtest</tspan> (client_credentials) — for /api/publish only</text>
+    <text class="leg" x="36"  y="138">  The two OAuth clients are not interchangeable: mixing them gives anonymous/mis-scoped connections.</text>
+    <text class="leg" x="16"  y="162">3. "SPA requests a token for speedtest"  ➜  <tspan font-weight="700" fill="#b91c1c">flipped</tspan>: the SPA is the ws-server client; the App server gets its own</text>
+    <text class="leg" x="36"  y="178">speedtest token by itself (client_credentials), exactly as in step ⑨ — no user involvement.</text>
+  </g>
+
+  <!-- legend -->
+  <g transform="translate(20,945)">
+    <line x1="0" y1="-6" x2="26" y2="-6" stroke="#2563eb" stroke-width="2" marker-end="url(#mBlue)"/><text class="leg" x="32" y="-2">login (blue)</text>
+    <line x1="110" y1="-6" x2="136" y2="-6" stroke="#047857" stroke-width="2" marker-end="url(#mGreen)"/><text class="leg" x="142" y="-2">connection / refresh (green)</text>
+    <line x1="290" y1="-6" x2="316" y2="-6" stroke="#b45309" stroke-width="2" marker-end="url(#mOrange)"/><text class="leg" x="322" y="-2">publish (orange)</text>
+    <line x1="420" y1="-6" x2="446" y2="-6" stroke="#6d28d9" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#mViolet)"/><text class="leg" x="452" y="-2">fan-out (violet)</text>
+    <line x1="560" y1="-6" x2="586" y2="-6" stroke="#b91c1c" stroke-width="2"/><text class="leg" x="592" y="-2">✎ = fix note vs sketch</text>
+  </g>
+</svg>
