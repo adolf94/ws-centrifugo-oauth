@@ -1,0 +1,73 @@
+# APP_DEPLOY via homelab gh_webhooks.
+# Builds the unified app+token-issuer image, pushes it to GHCR, then POSTs an
+# HMAC-signed payload to https://apis.adolfrey.com/gh_webhooks/d — the webhook
+# runs `IMAGE=<sha> docker compose pull && docker compose up -d --no-deps` in
+# /srv/deploy/<name>/ on the homelab host.
+# Required repo secrets:
+#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET  — Cloudflare Access service token
+#   HOMELAB_WEBHOOK_SECRET                         — WEBHOOK_SECRET shared with gh_webhooks
+
+name: build & deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.img.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # GHCR requires lowercase image names
+      - id: img
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.img.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          HOOK_SECRET: ${{ secrets.HOMELAB_WEBHOOK_SECRET }}
+          IMAGE: ${{ needs.build-and-push.outputs.image }}
+        run: |
+          TAG="${{ github.sha }}"
+          BODY=$(jq -nc --arg repo "${{ github.repository }}" --arg tag "$TAG" '{repo:$repo, tag:$tag}')
+          TS=$(date +%s)
+          SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)
+          curl -sf --retry 3 --max-time 30 \
+            -H "CF-Access-Client-Id: $CLIENT_ID" \
+            -H "CF-Access-Client-Secret: $CLIENT_SECRET" \
+            -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
+            -H "Content-Type: application/json" --data "$BODY" \
+            https://apis.adolfrey.com/gh_webhooks/d
+          echo "deploy accepted for $IMAGE (webhook runs compose pull + up -d --no-deps)"

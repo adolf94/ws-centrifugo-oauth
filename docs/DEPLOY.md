@@ -117,11 +117,106 @@ server {
 Or route **everything** through the SPA host: proxy `/connection/websocket`
 (and `/connection/*`) to :8000 instead of a second hostname.
 
-## 5 · Boot and verify
+## 4b · Push-based deploys via gh_webhooks (recommended)
+
+`/srv/deploy/<name>/` compose is the **prod target**; CI builds and posts. The
+`.github/workflows/deploy.yml` in this repo implements the homelab pattern:
+**one unified image** (`server/Dockerfile` now contains BOTH the App API *and*
+the token-issuer — the webhook injects a single `${IMAGE}`; each service picks
+its process via `command:`), pushed to GHCR, then `IMAGE=<sha> docker compose
+pull && docker compose up -d --no-deps` at the webhook.
+
+Host files at `/srv/deploy/<name>/` (git-ignored area; keep them backed up):
+
+```yaml
+# /srv/deploy/<name>/docker-compose.yml   (sibling .env holds the real secrets)
+services:
+  app:                                   # App API — ${IMAGE} ✔ webhook-managed
+    image: ${IMAGE}
+    command: ["node", "app.js"]
+    working_dir: /app/server
+    environment:
+      PORT: 3000
+      JWKS_URL: ${AUTH_JWKS_URL}
+      AUTH_ISSUER: ${AUTH_ISSUER}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE}
+      AUTH_AUTHORIZE_URL: ${AUTH_AUTHORIZE_URL}
+      AUTH_TOKEN_URL: ${AUTH_TOKEN_URL}
+      AUTH_CLIENT_ID: ${AUTH_CLIENT_ID}
+      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET}
+      AUTH_SERVICE_CLIENT_ID: ${AUTH_SERVICE_CLIENT_ID}
+      AUTH_SERVICE_CLIENT_SECRET: ${AUTH_SERVICE_CLIENT_SECRET}
+      AUTH_SERVICE_SCOPES: ${AUTH_SERVICE_SCOPES}
+      ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS}
+      AUTH_REDIRECT_URI: ${AUTH_REDIRECT_URI}
+      AUTH_REQUESTED_SCOPES: ${AUTH_REQUESTED_SCOPES}
+      REQUIRED_CLAIMS: ${REQUIRED_CLAIMS}
+      PUBLISH_REQUIRED_SCOPE: ${PUBLISH_REQUIRED_SCOPE}
+      # minting + publishing are delegated to the sidecar: NO HMAC/API-key here
+      TOKEN_ISSUER_URL: http://token-issuer:4000/realtime/token
+      CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL}
+      DEMO_CHANNEL: ${DEMO_CHANNEL}
+      SESSION_SECRET: ${SESSION_SECRET}
+      SESSION_TTL: ${SESSION_TTL}
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+  token-issuer:                          # sidecar — same ${IMAGE}, own env ✅
+    image: ${IMAGE}
+    command: ["node", "/app/token-issuer/server.js"]
+    environment:
+      JWKS_URL: ${AUTH_JWKS_URL}
+      AUTH_ISSUER: ${AUTH_ISSUER}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE}
+      ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS}
+      REQUIRED_CLAIMS: ${REQUIRED_CLAIMS}
+      # this is 1 of the 2 containers that hold Centrifugo secrets:
+      CENTRIFUGO_TOKEN_HMAC: ${CENTRIFUGO_TOKEN_HMAC_SECRET}
+      CENTRIFUGO_API_KEY: ${CENTRIFUGO_HTTP_API_KEY}
+      CENTRIFUGO_API_URL: http://centrifugo:8000/api
+      PUBLISH_REQUIRED_SCOPE: ${PUBLISH_REQUIRED_SCOPE}
+      CONNECTION_TTL: ${CONNECTION_TTL}
+      CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL}
+      DEMO_CHANNEL: ${DEMO_CHANNEL}
+    restart: unless-stopped
+
+  centrifugo:                            # infra — PINNED tag, NOT ${IMAGE}
+    image: centrifugo/centrifugo:v6
+    volumes:
+      - ./centrifugo.prod.json:/centrifugo/config.json:ro
+    environment:
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_HMAC_SECRET}
+      CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_HTTP_API_KEY}
+      CENTRIFUGO_LOG_LEVEL: info
+    ports: ["127.0.0.1:8000:8000"]
+    ulimits: { nofile: { soft: 65536, hard: 65536 } }
+    restart: unless-stopped
+```
+
+Rules this obeys (per the homelab doc): envelope `env_file` is NOT used — each
+service gets an explicit `environment:` map, preserving the trust split
+(`app` never receives the HMAC/API key; the 2 secret-holders are sidecar +
+centrifugo); only repo-built images flow through `${IMAGE}`; `centrifugo:v6`
+is pinned so app deploys never restart the WS node; `--no-deps` fits. The mock
+`auth-server` deliberately does not exist in prod — only in the dev compose.
+
+One-time wiring per the homelab APP_DEPLOY checklist:
+
+1. Whitelist in `gh_webhooks/deploy_config.json`:
+   `"<owner>/<repo>": {"dir": "/srv/deploy/<name>", "image": "ghcr.io/<owner>/<repo>"}`
+2. Repo secrets: `CF_ACCESS_CLIENT_ID`, `CF_ACCESS_CLIENT_SECRET`,
+   `HOMELAB_WEBHOOK_SECRET`.
+3. Expose via Caddy: `handle_path /<name>/*` → `app:3000` (and the WS upgrade
+   block for `realtime.*` → `127.0.0.1:8000`) as in §4.
+
+After the first green run, §5's manual boot is only needed for rebuilds of the
+host-side files themselves.
+
+## 5 · Boot and verify (manual, when not using §4b)
 
 ```bash
-docker compose up -d --build          # builds 3 images (auth-server optional/off)
-docker compose ps                     # 3× Up (auth-server Not created if removed from compose)
+docker compose up -d --build          # builds app + token-issuer (auth-server optional/off)
+docker compose ps
 ```
 
 Smoke checks:
