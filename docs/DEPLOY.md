@@ -1,8 +1,8 @@
 # Deploying the stack to your Docker server
 
-Step-by-step production deployment of the four services
-(`centrifugo`, `app` (App API), `token-issuer` (sidecar), `auth-server` mock —
-which you will NOT run in production) on a Docker host.
+Step-by-step production deployment of the realtime wall — two services
+(`token-issuer` + `centrifugo`; the dev compose's demo `app` and mock
+`auth-server` do NOT exist here) on a Docker host.
 
 Production architecture reminder — this deployment runs **the wall**:
 publisher apps + SPAs deploy elsewhere and attach as clients:
@@ -24,7 +24,7 @@ IdP (auth.<host>) ──JWKS──► token-issuer (verification only)
 |---|---|
 | Docker Engine ≥ 24 + Compose plugin | `docker compose version` |
 | ≥ 2 GB RAM, ports 80/443 (or 3000/8000 temporarily) | Centrifugo's `soft/hard` nofile ulimit (65536) is already in the compose file |
-| Your IdP reachable from the server | used by `app` + `token-issuer` for JWKS verification |
+| Your IdP reachable from the server | used by `token-issuer` for JWKS verification |
 | GitHub-style checkout | `git clone <repo> && cd <repo>` |
 
 ## 1 · Create `.env` from the sample
@@ -90,16 +90,6 @@ Do **not** put real secrets in `centrifugo/config.json` — the API key is env-i
 The SPA talks to two hosts:
 
 ```nginx
-# SPA/API on :3000 — plain web app + OAuth callbacks
-server {
-  server_name <spa-host>;
-  location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_set_header Host $host;
-  }
-  # TLS + ACME via your usual certbot/traefik config
-}
-
 # Centrifugo WS on :8000 — needs the Upgrade header(s)
 server {
   server_name realtime.<domain>;
