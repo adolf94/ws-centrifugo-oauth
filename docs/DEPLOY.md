@@ -119,6 +119,11 @@ Or route **everything** through the SPA host: proxy `/connection/websocket`
 
 ## 4b · Push-based deploys via gh_webhooks (recommended)
 
+The files below are tracked in the repo under [`deploy/`](../deploy/):
+`docker-compose.yml` (the compose in this section, with healthchecks),
+`centrifugo.prod.json` (admin off, origins placeholder), and a README with the
+copy-to-server one-liners. §4b explains why the compose looks the way it does.
+
 `/srv/deploy/<name>/` compose is the **prod target**; CI builds and posts. The
 `.github/workflows/deploy.yml` in this repo implements the homelab pattern:
 **one unified image** (`server/Dockerfile` now contains BOTH the App API *and*

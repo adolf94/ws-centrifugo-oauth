@@ -1,0 +1,35 @@
+{
+  "http_server": {
+    "port": 8000
+  },
+  "log": {
+    "level": "info"
+  },
+  "client": {
+    "allowed_origins": [
+      "https://realtime.your-domain.tld",
+      "https://spa.your-domain.tld"
+    ],
+    "disallow_anonymous_connection_tokens": true,
+    "token": {}
+  },
+  "http_api": {
+    "key": ""
+  },
+  "channel": {
+    "without_namespace": {
+      "allow_subscribe_for_client": true,
+      "presence": true,
+      "join_leave": true
+    }
+  },
+  "admin": {
+    "enabled": false
+  },
+  "health": {
+    "enabled": true
+  },
+  "prometheus": {
+    "enabled": true
+  }
+}
