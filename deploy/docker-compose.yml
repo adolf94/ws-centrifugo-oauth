@@ -1,13 +1,17 @@
 # PROD compose for the gh_webhooks deploy target (docs/DEPLOY.md §4b).
 # Host layout: /srv/deploy/<name>/  ← this directory's contents (compose, the
-# prod centrifugo config, and a .env made from the repo's .env.example).
+# prod centrifugo config, and a .env)
 #
-# Variable source: the SIBLING `.env` (next to this file). It is referenced
-# explicitly below (top-level `env_file`; compose ≥2.24, older 2.x simply
-# auto-loads the sibling `.env` — same file either way). It feeds ${VAR}
-# interpolation ONLY; per-service `environment:` maps decide what each
-# container actually receives, so the trust split holds:
-# the `app` service never receives the Centrifugo secrets.
+# What runs here is THE WALL ONLY — token-issuer + centrifugo:
+#   • the publishing app (publisher) + SPA live in their OWN deployment(s);
+#   • they join this compose's `realtime` Docker network and call the wall:
+#       mint:    POST http://token-issuer:4000/realtime/token   (Bearer IdP token)
+#       publish: POST http://token-issuer:4000/publish          (Bearer + scope)
+#       others:  POST http://token-issuer:4000/centrifugo/<method>
+#
+# Variable source: the SIBLING `.env` (next to this file). Referenced
+# explicitly below (top-level `env_file`; compose ≥2.24 — older 2.x simply
+# auto-loads the sibling `.env`; same file either way).
 #
 # Flow: GitHub Actions pushes ghcr.io/<owner>/<repo>:<sha> → gh_webhooks runs
 #   IMAGE=<sha> docker compose pull && docker compose up -d --no-deps
@@ -15,57 +19,13 @@
 env_file:
   - .env                             # also auto-loaded by older compose; explicit ≥2.24
 
-# Trust split (docs/CENTRIFUGO.md §2c): the app NEVER receives the HMAC/API
-# key; the two Centrifugo secrets live ONLY in token-issuer + centrifugo.
-# The mock auth-server does not exist in prod — the real IdP is used.
-#
-# NOTE: `IMAGE` is injected by gh_webhooks (= ghcr.io/<owner>/<repo>:<sha>).
-# For a first manual boot:  export IMAGE=ghcr.io/<owner>/<repo>[:tag]
-
 services:
-  app:                                    # App API — repo-built, webhook-managed
-    image: '${IMAGE:? IMAGE must be set — gh_webhooks does this; manual boot: export IMAGE=… }'
-    command: ["node", "app.js"]
-    working_dir: /app/server
-    environment:
-      PORT: 3000
-      # OAuth verification of publishers (the IdP):
-      JWKS_URL: ${AUTH_JWKS_URL}
-      AUTH_ISSUER: ${AUTH_ISSUER}
-      AUTH_AUDIENCE: ${AUTH_AUDIENCE}
-      AUTH_AUTHORIZE_URL: ${AUTH_AUTHORIZE_URL}
-      AUTH_TOKEN_URL: ${AUTH_TOKEN_URL}
-      AUTH_CLIENT_ID: ${AUTH_CLIENT_ID}
-      AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:-}
-      AUTH_SERVICE_CLIENT_ID: ${AUTH_SERVICE_CLIENT_ID}
-      AUTH_SERVICE_CLIENT_SECRET: ${AUTH_SERVICE_CLIENT_SECRET}
-      AUTH_SERVICE_SCOPES: ${AUTH_SERVICE_SCOPES}
-      ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS}
-      AUTH_REDIRECT_URI: ${AUTH_REDIRECT_URI}
-      AUTH_REQUESTED_SCOPES: ${AUTH_REQUESTED_SCOPES}
-      REQUIRED_CLAIMS: ${REQUIRED_CLAIMS:-sub,exp,iat,nbf,iss,aud}
-      # empty = token validation only (authN); publish scope gates publishing
-      REQUIRED_SCOPES: ${REQUIRED_SCOPES:-}
-      # minting + publishing are delegated — NO HMAC/API-key in this service:
-      TOKEN_ISSUER_URL: http://token-issuer:4000/realtime/token
-      CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL}
-      DEMO_CHANNEL: ${DEMO_CHANNEL:-chat}
-      SESSION_SECRET: ${SESSION_SECRET}
-      SESSION_TTL: ${SESSION_TTL:-28800}
-    ports:
-      - "127.0.0.1:3000:3000"             # fronted by Caddy (docs/DEPLOY.md §4)
-    healthcheck:
-      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-    restart: unless-stopped
-
-  token-issuer:                           # sidecar — same ${IMAGE}, own env ✅
+  token-issuer:                      # the OAuth-aware front door of the wall
     image: '${IMAGE:? IMAGE must be set — gh_webhooks does this; manual boot: export IMAGE=… }'
     command: ["node", "/app/token-issuer/server.js"]
     environment:
-      # OAuth validation (same IdP as the App API):
+      # OAuth validation of ANY publisher (your app's users via their app,
+      # M2M identities of your app, etc.):
       JWKS_URL: ${AUTH_JWKS_URL}
       AUTH_ISSUER: ${AUTH_ISSUER}
       AUTH_AUDIENCE: ${AUTH_AUDIENCE}
@@ -79,7 +39,8 @@ services:
       CONNECTION_TTL: ${CONNECTION_TTL:-300}
       CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL}
       DEMO_CHANNEL: ${DEMO_CHANNEL:-chat}
-    # no ports: reachable inside this compose network only
+    # no ports: reachable inside the `realtime` network only
+    networks: [realtime]
     healthcheck:
       test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:4000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
       interval: 10s
@@ -87,20 +48,21 @@ services:
       retries: 3
     restart: unless-stopped
 
-  centrifugo:                             # WS bus — infra, PINNED tag, NOT ${IMAGE}
+  centrifugo:                        # WS bus — infra, PINNED tag, NOT ${IMAGE}
     image: centrifugo/centrifugo:v6
     volumes:
       - ./centrifugo.prod.json:/centrifugo/config.json:ro
-    environment:                          # ─────────── the other secret holder ──
+    environment:                     # ─────────── the other secret holder ──
       CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${CENTRIFUGO_TOKEN_HMAC_SECRET}
       CENTRIFUGO_HTTP_API_KEY: ${CENTRIFUGO_HTTP_API_KEY}
       CENTRIFUGO_LOG_LEVEL: ${CENTRIFUGO_LOG_LEVEL:-info}
     ports:
-      - "127.0.0.1:8000:8000"             # WS (/connection/websocket) + /health + /metrics
+      - "127.0.0.1:8000:8000"        # WS (/connection/websocket) + /health + /metrics
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
+    networks: [realtime]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health >/dev/null 2>&1 || exit 1"]
       interval: 10s
@@ -108,9 +70,14 @@ services:
       retries: 3
     restart: unless-stopped
 
+# Named network so publisher deployments can attach:
+#   docker network connect realtime <publisher-app-container>
+# or declare it external in the app's own compose file:
+#   networks: { realtime: { name: realtime, external: true } }
+networks:
+  realtime:
+    name: realtime
+
 # If you prefer Caddy reaching containers by name (homelab `proxy` network)
-# instead of 127.0.0.1 ports, add:
-# networks:
-#   proxy:
-#     external: true
-# and `networks: [proxy]` on `app` (and caddy's file gains a reverse_proxy app:3000).
+# instead of 127.0.0.1 ports, add `proxy: { external: true }` here and move
+# the centrifugo port to container-name DNS routing in Caddy.
