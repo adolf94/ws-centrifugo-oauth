@@ -145,8 +145,6 @@ proxy:
     # mint shaping (sub/channels/subs on /realtime/token) — who may use it:
     MINT_SHAPING_SCOPE: ${MINT_SHAPING_SCOPE:-<PUBLISH_REQUIRED_SCOPE>}
     MINT_MAX_SUBS: ${MINT_MAX_SUBS:-32}
-    # per-service channel separation (multi-tenant): <prefix>:<client_id>:*
-    SERVICE_CHANNEL_PREFIX: ${SERVICE_CHANNEL_PREFIX:-}
     # group channel rewriting: group:<client_id>,<group> (prepend) or group:<group>,<client_id> (append)
     GROUP_CLIENT_ID_POSITION: ${GROUP_CLIENT_ID_POSITION:-prepend}
     GROUP_CLIENT_ID_DELIMITER: ${GROUP_CLIENT_ID_DELIMITER:-,}

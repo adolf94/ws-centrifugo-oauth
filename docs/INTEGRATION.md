@@ -199,26 +199,40 @@ Two things to know:
   (re)connect starts correct, and use `subscribe`/`unsubscribe` for the
   live deltas in between.
 
-### 1.2d Per-service channel separation (multi-tenant mode)
+### 1.2d What separation actually holds (and its knobs)
 
-Namespaces group channels by *feature*; to group them by *calling service*,
-turn on the wall's `SERVICE_CHANNEL_PREFIX` (e.g. `svc`, matching the `svc`
-namespace in the Centrifugo config). Every channel your service then names —
-publishing, broadcasting, subscribing users, mint shaping — must live under
-**its own verified identity**:
+The §1.2b auto-tagging above is effective per-service separation for the
+`group:*` namespace — no policy flag needed:
+
+* **Explicitly named by the wall, never by you.** Every `group:*` channel you
+  reference — in mint shaping (`channels`/`subs`) and in Server-API relays
+  (`publish`, `broadcast`, `subscribe`, `unsubscribe`, `presence`, …) — is
+  rewritten to embed the wall-verified `client_id`. Your `group:group-1`
+  becomes `group:app-1,group-1`; another service's `group:group-1` becomes
+  `group:other-svc,group-1`. Same intent, different physical channel — they
+  can never collide.
+* **No injection possible.** A service that literally writes another
+  service's tagged channel (e.g. uploads `group:other-svc,group-1`) does not
+  reach it: the tag is *prepended again* to its own — it lands on
+  `group:app-1,other-svc,group-1`, which nobody subscribes to. Verified live:
+  the injected publication was delivered to NO connected client.
+* **Spawn learns the true names.** Every mint bundle echoes the final channel
+  names: `connection.subs` = `{ "group:app-1,group-1": {} }` — publish to what
+  you minted, subscribe what you minted.
+
+Tuning (wall env):
 
 ```
-speedtest (client_id)  →  svc:speedtest:group1, svc:speedtest:alerts
-weather   (client_id)  →  svc:weather:dashboard
+GROUP_CLIENT_ID_POSITION=prepend|append   # default prepend: group:app-1,group-1
+GROUP_CLIENT_ID_DELIMITER=,               # default ,
 ```
 
-The middle segment is checked against the OAuth `client_id` the wall just
-verified cryptographically — a service cannot publish into, subscribe users
-to, or mint subscriptions for another service's channels
-(`403 service_channel_not_allowed`). The §1.2b/§1.2c group flows work
-unchanged in this mode; just name your channels inside your own prefix.
-Off by default (`SERVICE_CHANNEL_PREFIX` empty) — then any allow-listed
-channel is shared by all publisher services.
+`GROUP_CLIENT_ID_POSITION=off` disables rewriting entirely (shared group
+channels — only sensible if you hand-partition yourself).
+
+This isolation is scoped to the `group` namespace. If another namespace ever
+hosts per-service data, that partitioning either happens the same way (a
+wall-side namespace-tagging rule) or the namespace must stay service-agnostic.
 
 ### 1.3 Publishing: `POST {proxy}/publish` (and any other Server API call)
 

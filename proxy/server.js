@@ -80,7 +80,8 @@ const CHANNEL = process.env.DEMO_CHANNEL || 'chat';
 // Publish hop: Centrifugo v6 OSS protects its HTTP Server API with X-API-Key
 // ONLY (Bearer/JWKS server-API auth exists in Centrifugo PRO, not OSS). This
 // sidecar is the single holder of that key, in front of the /api door.
-const CENTRIFUGO_API_URL = process.env.CENTRIFUGO_API_URL || 'http://centrifugo:8000/api';const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY || '';
+const CENTRIFUGO_API_URL = process.env.CENTRIFUGO_API_URL || 'http://centrifugo:8000/api';
+const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY || '';
 const PUBLISH_REQUIRED_SCOPE =
   process.env.PUBLISH_REQUIRED_SCOPE || 'api://ws-server/app:publisher';
 
@@ -94,16 +95,6 @@ const MINT_SHAPING_SCOPE =
   process.env.MINT_SHAPING_SCOPE || PUBLISH_REQUIRED_SCOPE;
 // How many server-side subscriptions one mint may attach.
 const MINT_MAX_SUBS = parseInt(process.env.MINT_MAX_SUBS || '32', 10);
-// Per-service channel separation (multi-tenant posture). When set (e.g.
-// "svc"), every channel a caller NAMES — in Server-API relays AND in mint
-// shaping — must live under
-//     <prefix>:<service_subject>:<…>
-// where service_subject is the client_id (or sub) of the token JUST
-// verified here. A service can then never publish into, subscribe users
-// to, or mint for another service's channels. Requires a Centrifugo
-// namespace named like the prefix. Empty (default) = off.
-const SERVICE_CHANNEL_PREFIX = process.env.SERVICE_CHANNEL_PREFIX || '';
-
 // Group channel client_id rewriting. When a caller names a group channel
 // (under namespace `group:`, e.g. `group:group-1`), the proxy rewrites it
 // by prepending or appending the verified caller's client_id:
@@ -297,46 +288,6 @@ function validateSubs(value) {
     }
   }
   return entries.length ? value : undefined;
-}
-
-// Which channels a given Server-API request names (for the per-service
-// prefix check). batch recurses one level into its nested commands.
-function channelsInRequest(method, body) {
-  const b = body ?? {};
-  switch (method) {
-    case 'publish':
-    case 'subscribe':
-    case 'unsubscribe':
-    case 'presence':
-    case 'presence_stats':
-    case 'history':
-    case 'history_remove':
-      return b.channel !== undefined ? [b.channel] : [];
-    case 'broadcast':
-      return Array.isArray(b.channels) ? b.channels : [];
-    case 'batch': {
-      const out = [];
-      for (const cmd of Array.isArray(b.commands) ? b.commands : []) {
-        const nestedMethod = Object.keys(cmd ?? {})[0];
-        if (nestedMethod) out.push(...channelsInRequest(nestedMethod, cmd[nestedMethod]));
-      }
-      return out;
-    }
-    default:
-      return [];
-  }
-}
-
-// Returns null when every channel is inside the caller's own prefix,
-// otherwise the first violation (used for the 403 payload).
-function serviceChannelViolation(channels, serviceSubject) {
-  if (!SERVICE_CHANNEL_PREFIX) return null;
-  const required = `${SERVICE_CHANNEL_PREFIX}:${serviceSubject}:`;
-  for (const ch of channels) {
-    if (typeof ch === 'string' && ch.startsWith(required)) continue;
-    return { channel: ch, required };
-  }
-  return null;
 }
 
 function getClientId(payload) {
@@ -538,21 +489,6 @@ app.post('/realtime/token', async (req, res) => {
     subs = rewrittenSubs;
   }
 
-  // Per-service separation: the channels a service may mint subscriptions
-  // for are bounded by ITS OWN verified subject (not the minted-for user).
-  const callerSubject = payload.client_id ?? payload.sub ?? '';
-  const mintViolation = serviceChannelViolation(
-    [...(channels ?? []), ...(subs ? Object.keys(subs) : [])],
-    callerSubject
-  );
-  if (mintViolation) {
-    return res.status(403).json({
-      error: 'service_channel_not_allowed',
-      detail: `channel "${mintViolation.channel}" is outside this service's prefix — every channel must match ${mintViolation.required}*`,
-      service_subject: callerSubject,
-    });
-  }
-
   const minted = mintConnectionJwt({
     subject,
     scopes,
@@ -735,17 +671,6 @@ async function relayServerApiMethod(req, res) {
   const clientId = getClientId(payload);
   const transformedBody = transformChannelsInRequestBody(method, req.body ?? {}, clientId);
 
-  // Per-service separation: every channel this request names must live
-  // under the CALLER's own verified subject prefix.
-  const relaySubject = payload.client_id ?? payload.sub ?? '';
-  const relayViolation = serviceChannelViolation(channelsInRequest(method, transformedBody), relaySubject);
-  if (relayViolation) {
-    return res.status(403).json({
-      error: 'service_channel_not_allowed',
-      detail: `channel "${relayViolation.channel}" is outside this service's prefix — every channel must match ${relayViolation.required}*`,
-      service_subject: relaySubject,
-    });
-  }
   if (!requireApiKey(res)) return;
 
   let result;
@@ -757,6 +682,7 @@ async function relayServerApiMethod(req, res) {
       detail: `relay to ${CENTRIFUGO_API_URL}/${method} failed: ${err instanceof Error ? err.message : String(err)}`,
     });
   }
+
   respondFromCentrifugo(res, method, result, {
     claims: {
       sub: payload.sub ?? null,
@@ -783,7 +709,6 @@ app.get('/healthz', (_req, res) => {
     required_scopes: REQUIRED_SCOPES,
     publish_required_scope: PUBLISH_REQUIRED_SCOPE,
     mint_shaping_scope: MINT_SHAPING_SCOPE,
-    service_channel_prefix: SERVICE_CHANNEL_PREFIX || null,
     group_client_id_position: GROUP_CLIENT_ID_POSITION,
     group_client_id_delimiter: GROUP_CLIENT_ID_DELIMITER,
     connection_ttl: CONNECTION_TTL,
@@ -804,7 +729,6 @@ app.listen(PORT, () => {
   console.log(`[proxy]   allowed origins: ${ALLOWED_ORIGINS.join(', ')} (server-to-server callers pass without Origin)`);
   console.log(`[proxy]   required scopes: ${REQUIRED_SCOPES.join(' ')}; publish scope: ${PUBLISH_REQUIRED_SCOPE}`);
   console.log(`[proxy]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"; shaping (sub/channels/subs) requires scope "${MINT_SHAPING_SCOPE}", max ${MINT_MAX_SUBS} subs`);
-  console.log(`[proxy]   per-service channels: ${SERVICE_CHANNEL_PREFIX ? `${SERVICE_CHANNEL_PREFIX}:<service_subject>:* (enforced on relays + mints)` : '(off — any allow-listed channel)'}`);
   console.log(`[proxy]   group client_id rewrite: position=${GROUP_CLIENT_ID_POSITION}, delimiter="${GROUP_CLIENT_ID_DELIMITER}" (rewrites group:* channels)`);
   console.log(`[proxy]   Server-API proxy → ${CENTRIFUGO_API_URL} (X-API-Key held here only)`);
   console.log(`[proxy]   proxyable methods: ${ALLOWED_API_METHODS.join(', ')}`);
