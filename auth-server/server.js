@@ -114,7 +114,7 @@ function signRS256(signingInput) {
     .toString('base64url');
 }
 
-function issueAccessToken({ sub = '42', scope = 'realtime:connect realtime:publish' }) {
+function issueAccessToken({ sub = '42', scope = 'realtime:connect realtime:publish', client_id = 'spa-demo-client' }) {
   const iat = Math.floor(Date.now() / 1000);
   const header = { alg: 'RS256', typ: 'JWT', kid: JWK.kid };
   const claims = {
@@ -126,7 +126,7 @@ function issueAccessToken({ sub = '42', scope = 'realtime:connect realtime:publi
     exp: iat + TOKEN_TTL,
     jti: crypto.randomUUID(),
     scope, // <- the OAuth scope claim our REQUIRED_SCOPES policy checks
-    client_id: 'spa-demo-client',
+    client_id,
   };
   const signingInput = `${base64urlJson(header)}.${base64urlJson(claims)}`;
   const token = `${signingInput}.${signRS256(signingInput)}`;
@@ -227,9 +227,10 @@ const server = http.createServer(async (req, res) => {
       const response = issueAccessToken({
         sub: String(body.sub || '42'),
         scope: granted.join(' '),
+        client_id: String(body.client_id || 'spa-demo-client'),
       });
       console.log(
-        `[auth-server] issued token sub="${body.sub || '42'}" scopes="${response.scope}"`
+        `[auth-server] issued token sub="${body.sub || '42'}" client_id="${body.client_id || 'spa-demo-client'}" scopes="${response.scope}"`
       );
       return sendJSON(res, 200, response);
     } catch (err) {

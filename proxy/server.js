@@ -84,6 +84,36 @@ const CENTRIFUGO_API_URL = process.env.CENTRIFUGO_API_URL || 'http://centrifugo:
 const PUBLISH_REQUIRED_SCOPE =
   process.env.PUBLISH_REQUIRED_SCOPE || 'api://ws-server/app:publisher';
 
+// Mint shaping (server-side subscriptions + mint-on-behalf): who may choose
+// the `sub`/`channels`/`subs` of a mint. Default = the same trust marker as
+// publishing, i.e. the app-server / M2M service identities. Public SPA
+// clients (browser-direct mint lane) never hold it — they mint for
+// themselves with the default channel, so no browser can self-select
+// arbitrary groups.
+const MINT_SHAPING_SCOPE =
+  process.env.MINT_SHAPING_SCOPE || PUBLISH_REQUIRED_SCOPE;
+// How many server-side subscriptions one mint may attach.
+const MINT_MAX_SUBS = parseInt(process.env.MINT_MAX_SUBS || '32', 10);
+// Per-service channel separation (multi-tenant posture). When set (e.g.
+// "svc"), every channel a caller NAMES — in Server-API relays AND in mint
+// shaping — must live under
+//     <prefix>:<service_subject>:<…>
+// where service_subject is the client_id (or sub) of the token JUST
+// verified here. A service can then never publish into, subscribe users
+// to, or mint for another service's channels. Requires a Centrifugo
+// namespace named like the prefix. Empty (default) = off.
+const SERVICE_CHANNEL_PREFIX = process.env.SERVICE_CHANNEL_PREFIX || '';
+
+// Group channel client_id rewriting. When a caller names a group channel
+// (under namespace `group:`, e.g. `group:group-1`), the proxy rewrites it
+// by prepending or appending the verified caller's client_id:
+//   prepend (default) -> group:app-1,group-1
+//   append            -> group:group-1,app-1
+// Applies to both mint shaping (/realtime/token channels/subs) and Server-API relays.
+const GROUP_CLIENT_ID_POSITION =
+  (process.env.GROUP_CLIENT_ID_POSITION || 'prepend').toLowerCase();
+const GROUP_CLIENT_ID_DELIMITER = process.env.GROUP_CLIENT_ID_DELIMITER || ',';
+
 // Origin fence for browser-originated callers (Centrifugo-style glob, e.g.
 // https://*.adolfrey.com — one '*' matches a single subdomain label).
 // Server-to-server callers send NO Origin header and always pass. Empty env
@@ -104,14 +134,17 @@ function originAllowed(origin) {
 // Generic Server-API proxy policy: which methods may be relayed at all, and
 // extra scope for the state-changing ones (read-only methods only need to
 // pass the base policy). Override ALLOWED_API_METHODS to tighten/extend.
+// `subscribe` + `unsubscribe` = DYNAMIC server-side subscriptions: add/remove
+// a live user's sessions to/from a channel at runtime (the runtime half of
+// the mint-time `subs` claim — see INTEGRATION.md §1.2c).
 const ALLOWED_API_METHODS = String(
   process.env.ALLOWED_API_METHODS ||
-    'publish,broadcast,presence,presence_stats,history,channels,info,history_remove,unsubscribe,disconnect,batch'
+    'publish,broadcast,subscribe,unsubscribe,presence,presence_stats,history,channels,info,history_remove,disconnect,batch'
 )
   .split(/[\s,]+/)
   .filter(Boolean);
 const STATE_CHANGING_METHODS = new Set([
-  'publish', 'broadcast', 'unsubscribe', 'disconnect', 'history_remove', 'batch',
+  'publish', 'broadcast', 'subscribe', 'unsubscribe', 'disconnect', 'history_remove', 'batch',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -223,7 +256,158 @@ function b64urlJson(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64url');
 }
 
-function mintConnectionJwt({ subject, scopes, maxExp }) {
+// Channel-name policy for mint shaping: printable ASCII, no spaces, ≤255
+// (Centrifugo's own rules; `:` namespace, `#` user-limited, `$` private
+// boundaries all legal). Centrifugo re-validates on connect anyway.
+const CHANNEL_NAME_RE = /^[\x21-\x7e]{1,255}$/;
+
+function validateChannels(value) {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) {
+    throw new Error('channels must be an array of channel name strings');
+  }
+  if (value.length > MINT_MAX_SUBS) {
+    throw new Error(`too many channels (max ${MINT_MAX_SUBS})`);
+  }
+  for (const c of value) {
+    if (typeof c !== 'string' || !CHANNEL_NAME_RE.test(c)) {
+      throw new Error(`invalid channel name: ${JSON.stringify(c)}`);
+    }
+  }
+  return value.length ? value : undefined;
+}
+
+// subs: { "<channel>": { data?, info?, override? } } — per-channel options
+// for server-side subscriptions (see Centrifugo connection-token claims).
+function validateSubs(value) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('subs must be an object mapping channel -> { data?, info?, override? }');
+  }
+  const entries = Object.entries(value);
+  if (entries.length > MINT_MAX_SUBS) {
+    throw new Error(`too many subscriptions (max ${MINT_MAX_SUBS})`);
+  }
+  for (const [ch, opts] of entries) {
+    if (!CHANNEL_NAME_RE.test(ch)) {
+      throw new Error(`invalid channel name: ${JSON.stringify(ch)}`);
+    }
+    if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
+      throw new Error(`subs[${JSON.stringify(ch)}] must be an options object`);
+    }
+  }
+  return entries.length ? value : undefined;
+}
+
+// Which channels a given Server-API request names (for the per-service
+// prefix check). batch recurses one level into its nested commands.
+function channelsInRequest(method, body) {
+  const b = body ?? {};
+  switch (method) {
+    case 'publish':
+    case 'subscribe':
+    case 'unsubscribe':
+    case 'presence':
+    case 'presence_stats':
+    case 'history':
+    case 'history_remove':
+      return b.channel !== undefined ? [b.channel] : [];
+    case 'broadcast':
+      return Array.isArray(b.channels) ? b.channels : [];
+    case 'batch': {
+      const out = [];
+      for (const cmd of Array.isArray(b.commands) ? b.commands : []) {
+        const nestedMethod = Object.keys(cmd ?? {})[0];
+        if (nestedMethod) out.push(...channelsInRequest(nestedMethod, cmd[nestedMethod]));
+      }
+      return out;
+    }
+    default:
+      return [];
+  }
+}
+
+// Returns null when every channel is inside the caller's own prefix,
+// otherwise the first violation (used for the 403 payload).
+function serviceChannelViolation(channels, serviceSubject) {
+  if (!SERVICE_CHANNEL_PREFIX) return null;
+  const required = `${SERVICE_CHANNEL_PREFIX}:${serviceSubject}:`;
+  for (const ch of channels) {
+    if (typeof ch === 'string' && ch.startsWith(required)) continue;
+    return { channel: ch, required };
+  }
+  return null;
+}
+
+function getClientId(payload) {
+  if (!payload) return '';
+  return payload.client_id ?? payload.azp ?? payload.sub ?? '';
+}
+
+function transformGroupChannel(
+  channel,
+  clientId,
+  position = GROUP_CLIENT_ID_POSITION,
+  delimiter = GROUP_CLIENT_ID_DELIMITER
+) {
+  if (typeof channel !== 'string' || !clientId) return channel;
+  if (!channel.startsWith('group:')) return channel;
+  if (position === 'off' || position === 'none' || position === 'false') return channel;
+  const groupPart = channel.slice('group:'.length);
+  if (!groupPart) return channel;
+
+  if (position === 'append') {
+    if (groupPart.endsWith(`${delimiter}${clientId}`)) return channel;
+    return `group:${groupPart}${delimiter}${clientId}`;
+  } else {
+    // default: prepend
+    if (groupPart.startsWith(`${clientId}${delimiter}`)) return channel;
+    return `group:${clientId}${delimiter}${groupPart}`;
+  }
+}
+
+function transformChannelsInRequestBody(method, body, clientId) {
+  if (!body || typeof body !== 'object' || !clientId) return body;
+  const b = { ...body };
+  switch (method) {
+    case 'publish':
+    case 'subscribe':
+    case 'unsubscribe':
+    case 'presence':
+    case 'presence_stats':
+    case 'history':
+    case 'history_remove':
+      if (typeof b.channel === 'string') {
+        b.channel = transformGroupChannel(b.channel, clientId);
+      }
+      return b;
+    case 'broadcast':
+      if (Array.isArray(b.channels)) {
+        b.channels = b.channels.map((ch) => transformGroupChannel(ch, clientId));
+      }
+      return b;
+    case 'batch':
+      if (Array.isArray(b.commands)) {
+        b.commands = b.commands.map((cmd) => {
+          if (!cmd || typeof cmd !== 'object') return cmd;
+          const nestedMethod = Object.keys(cmd)[0];
+          if (!nestedMethod) return cmd;
+          return {
+            [nestedMethod]: transformChannelsInRequestBody(
+              nestedMethod,
+              cmd[nestedMethod],
+              clientId
+            ),
+          };
+        });
+      }
+      return b;
+    default:
+      return b;
+  }
+}
+
+function mintConnectionJwt({ subject, scopes, maxExp, channels, subs }) {
   const now = Math.floor(Date.now() / 1000);
   const exp = Math.min(maxExp, now + CONNECTION_TTL);
   const header = { alg: 'HS256', typ: 'JWT' };
@@ -233,6 +417,12 @@ function mintConnectionJwt({ subject, scopes, maxExp }) {
     iat: now,
     info: { scopes: [...scopes], minted_by: 'proxy' },
   };
+  // Server-side subscriptions: Centrifugo subscribes the client to these
+  // channels automatically upon connect (connection-token `channels`/`subs`
+  // claims). This is the app's lever for group membership — and the ONLY
+  // road into namespaces with allow_subscribe_for_client off.
+  if (channels) claims.channels = channels;
+  if (subs) claims.subs = subs;
   const input = `${b64urlJson(header)}.${b64urlJson(claims)}`;
   const sig = crypto
     .createHmac('sha256', CENTRIFUGO_TOKEN_HMAC)
@@ -247,26 +437,44 @@ function mintConnectionJwt({ subject, scopes, maxExp }) {
 const app = express();
 app.use(express.json({ limit: '16kb' }));
 
-// Origin fence: applies to every route except the health endpoint (GET).
-// Browsers always send Origin on CORS-style calls; servers don't — so this
-// only ever bites a browser pointing at the internal door, which is exactly
-// what the fence is for.
+// Origin fence + CORS: applies to every route except the health endpoint.
+// Browsers always send Origin on cross-origin calls; servers don't — so this
+// only ever bites a browser, which is exactly what the fence is for.
+// Allowed browsers get real CORS headers back so a SPA can call the wall
+// DIRECTLY (mint from the browser — Azure-token-endpoint style, no app
+// relay needed): the preflight is answered here, and actual responses carry
+// the same headers.
 app.use((req, res, next) => {
   if (req.path === '/healthz') return next();
   const origin = req.headers.origin;
-  if (originAllowed(origin)) return next();
-  console.warn(`[proxy]   origin rejected: ${origin} ${req.method} ${req.path}`);
-  return res.status(403).json({
-    error: 'origin_not_allowed',
-    detail: `origin "${origin}" is not in ALLOWED_ORIGINS (${ALLOWED_ORIGINS.join(', ')})`,
-  });
+  if (!origin) return next();            // server-to-server caller — passes
+  if (!originAllowed(origin)) {
+    console.warn(`[proxy]   origin rejected: ${origin} ${req.method} ${req.path}`);
+    return res.status(403).json({
+      error: 'origin_not_allowed',
+      detail: `origin "${origin}" is not in ALLOWED_ORIGINS (${ALLOWED_ORIGINS.join(', ')})`,
+    });
+  }
+  res.setHeader('Access-Control-Allow-Origin', origin);     // echo — never a wildcard
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
+  res.setHeader('Access-Control-Max-Age', '600');
+  if (req.method === 'OPTIONS') return res.status(204).end(); // CORS preflight
+  return next();
 });
 
 /**
  * POST /realtime/token — mint a Centrifugo connection JWT.
  *
  * The subject of the minted token is exactly the subject of the verified
- * token: nobody can mint for someone else.
+ * token: nobody can mint for someone else. One exception: callers holding
+ * MINT_SHAPING_SCOPE (app-server/M2M identities) may mint on behalf of a
+ * user (body.sub) and attach server-side subscriptions (body.channels /
+ * body.subs) — Centrifugo then subscribes that client to exactly those
+ * channels on connect, which is how group membership is enforced: pair it
+ * with a namespace that has allow_subscribe_for_client OFF, and the mint
+ * becomes the only door into the group channels.
  */
 app.post('/realtime/token', async (req, res) => {
   const verified = await verifyPublisher(req);
@@ -275,11 +483,82 @@ app.post('/realtime/token', async (req, res) => {
   }
   const { payload, scopes } = verified;
 
-  const subject = payload.sub ?? payload.client_id ?? ''; // never mint anonymous
+  const body = req.body ?? {};
+
+  // ── mint shaping: server-side subscriptions + mint-on-behalf ──────────
+  // Only identities holding MINT_SHAPING_SCOPE (app servers / M2M services
+  // by default — the same trust marker as publishing) may pick the subject
+  // or the channels. User/SPA tokens (browser-direct lane) always mint for
+  // THEMSELVES with the default channel — otherwise any browser could
+  // self-select arbitrary groups.
+  const wantsShaping = body.sub !== undefined || body.channels !== undefined || body.subs !== undefined;
+  if (wantsShaping && !scopes.has(MINT_SHAPING_SCOPE)) {
+    return res.status(403).json({
+      error: 'insufficient_scope',
+      detail: `choosing sub/channels/subs on a mint requires scope "${MINT_SHAPING_SCOPE}" (grant it to app-server/service identities only, never to public SPA clients)`,
+      granted_scopes: [...scopes],
+    });
+  }
+
+  // Subject: the verified identity, or (scoped callers only) an explicit
+  // mint-on-behalf subject — e.g. the app server minting for its user.
+  let subject = payload.sub ?? payload.client_id ?? ''; // never mint anonymous
+  if (body.sub !== undefined) {
+    if (typeof body.sub !== 'string' || !body.sub.trim()) {
+      return res.status(400).json({
+        error: 'invalid_subject',
+        detail: 'sub must be a non-empty string (the Centrifugo user id to mint for)',
+      });
+    }
+    subject = body.sub.trim();
+  }
+
+  // Channels / subs → embedded as server-side subscriptions in the JWT.
+  let channels;
+  let subs;
+  try {
+    channels = validateChannels(body.channels);
+    subs = validateSubs(body.subs);
+  } catch (err) {
+    return res.status(400).json({
+      error: 'invalid_subs',
+      detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  const clientId = getClientId(payload);
+  if (channels) {
+    channels = channels.map((ch) => transformGroupChannel(ch, clientId));
+  }
+  if (subs) {
+    const rewrittenSubs = {};
+    for (const [ch, opts] of Object.entries(subs)) {
+      rewrittenSubs[transformGroupChannel(ch, clientId)] = opts;
+    }
+    subs = rewrittenSubs;
+  }
+
+  // Per-service separation: the channels a service may mint subscriptions
+  // for are bounded by ITS OWN verified subject (not the minted-for user).
+  const callerSubject = payload.client_id ?? payload.sub ?? '';
+  const mintViolation = serviceChannelViolation(
+    [...(channels ?? []), ...(subs ? Object.keys(subs) : [])],
+    callerSubject
+  );
+  if (mintViolation) {
+    return res.status(403).json({
+      error: 'service_channel_not_allowed',
+      detail: `channel "${mintViolation.channel}" is outside this service's prefix — every channel must match ${mintViolation.required}*`,
+      service_subject: callerSubject,
+    });
+  }
+
   const minted = mintConnectionJwt({
     subject,
     scopes,
     maxExp: Number.isFinite(payload.exp) ? payload.exp : Infinity,
+    channels,
+    subs,
   });
 
   return res.json({
@@ -289,6 +568,8 @@ app.post('/realtime/token', async (req, res) => {
       channel: CHANNEL,
       expires_in: Math.max(0, minted.expiresAt - Math.floor(Date.now() / 1000)),
       subject,
+      ...(channels ? { channels } : {}),
+      ...(subs ? { subs } : {}),
     },
     minted_by: 'proxy',
     claims: {
@@ -375,7 +656,12 @@ app.post('/publish', async (req, res) => {
   }
   if (!requireApiKey(res)) return;
 
-  const from = payload.sub ?? `service ${payload.client_id ?? 'unknown'}`;
+  const clientId = getClientId(payload);
+  const from = payload.sub ?? `service ${clientId || 'unknown'}`;
+  const targetChannel =
+    typeof req.body?.channel === 'string' && req.body.channel.trim() !== ''
+      ? transformGroupChannel(req.body.channel.trim(), clientId)
+      : CHANNEL;
   const text =
     typeof req.body?.message === 'string' && req.body.message.trim() !== ''
       ? req.body.message.trim()
@@ -384,7 +670,7 @@ app.post('/publish', async (req, res) => {
   let result;
   try {
     result = await centrifugoFetch('publish', {
-      channel: CHANNEL,
+      channel: targetChannel,
       data: { text, from, sent_at: new Date().toISOString() },
     });
   } catch (err) {
@@ -395,7 +681,7 @@ app.post('/publish', async (req, res) => {
   }
 
   respondFromCentrifugo(res, 'publish', result, {
-    published: { text, from },
+    published: { text, from, channel: targetChannel },
     claims: {
       sub: payload.sub ?? null,
       service_subject: payload.client_id ?? null,
@@ -445,11 +731,26 @@ async function relayServerApiMethod(req, res) {
       granted_scopes: [...scopes],
     });
   }
+
+  const clientId = getClientId(payload);
+  const transformedBody = transformChannelsInRequestBody(method, req.body ?? {}, clientId);
+
+  // Per-service separation: every channel this request names must live
+  // under the CALLER's own verified subject prefix.
+  const relaySubject = payload.client_id ?? payload.sub ?? '';
+  const relayViolation = serviceChannelViolation(channelsInRequest(method, transformedBody), relaySubject);
+  if (relayViolation) {
+    return res.status(403).json({
+      error: 'service_channel_not_allowed',
+      detail: `channel "${relayViolation.channel}" is outside this service's prefix — every channel must match ${relayViolation.required}*`,
+      service_subject: relaySubject,
+    });
+  }
   if (!requireApiKey(res)) return;
 
   let result;
   try {
-    result = await centrifugoFetch(method, req.body ?? {});
+    result = await centrifugoFetch(method, transformedBody);
   } catch (err) {
     return res.status(502).json({
       error: 'centrifugo_unreachable',
@@ -481,6 +782,10 @@ app.get('/healthz', (_req, res) => {
     required_claims: requiredClaims(),
     required_scopes: REQUIRED_SCOPES,
     publish_required_scope: PUBLISH_REQUIRED_SCOPE,
+    mint_shaping_scope: MINT_SHAPING_SCOPE,
+    service_channel_prefix: SERVICE_CHANNEL_PREFIX || null,
+    group_client_id_position: GROUP_CLIENT_ID_POSITION,
+    group_client_id_delimiter: GROUP_CLIENT_ID_DELIMITER,
     connection_ttl: CONNECTION_TTL,
     channel: CHANNEL,
     allowed_client_ids: ALLOWED_CLIENT_IDS,
@@ -498,7 +803,9 @@ app.listen(PORT, () => {
   console.log(`[proxy]   issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
   console.log(`[proxy]   allowed origins: ${ALLOWED_ORIGINS.join(', ')} (server-to-server callers pass without Origin)`);
   console.log(`[proxy]   required scopes: ${REQUIRED_SCOPES.join(' ')}; publish scope: ${PUBLISH_REQUIRED_SCOPE}`);
-  console.log(`[proxy]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"`);
+  console.log(`[proxy]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"; shaping (sub/channels/subs) requires scope "${MINT_SHAPING_SCOPE}", max ${MINT_MAX_SUBS} subs`);
+  console.log(`[proxy]   per-service channels: ${SERVICE_CHANNEL_PREFIX ? `${SERVICE_CHANNEL_PREFIX}:<service_subject>:* (enforced on relays + mints)` : '(off — any allow-listed channel)'}`);
+  console.log(`[proxy]   group client_id rewrite: position=${GROUP_CLIENT_ID_POSITION}, delimiter="${GROUP_CLIENT_ID_DELIMITER}" (rewrites group:* channels)`);
   console.log(`[proxy]   Server-API proxy → ${CENTRIFUGO_API_URL} (X-API-Key held here only)`);
   console.log(`[proxy]   proxyable methods: ${ALLOWED_API_METHODS.join(', ')}`);
   if (!CENTRIFUGO_TOKEN_HMAC) {

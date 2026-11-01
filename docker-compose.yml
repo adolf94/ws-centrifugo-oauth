@@ -159,6 +159,8 @@ services:
       # Bundle contents returned (and relayed to the SPA by the App server):
       CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL:-ws://localhost:8000/connection/websocket}
       DEMO_CHANNEL: ${DEMO_CHANNEL:-chat}
+      GROUP_CLIENT_ID_POSITION: ${GROUP_CLIENT_ID_POSITION:-prepend}
+      GROUP_CLIENT_ID_DELIMITER: ${GROUP_CLIENT_ID_DELIMITER:-,}
     restart: unless-stopped
 
   # ------------------------------------------------------------------

@@ -142,6 +142,14 @@ proxy:
     CENTRIFUGO_API_URL: http://centrifugo:8000/api
     CENTRIFUGO_API_KEY: ${CENTRIFUGO_HTTP_API_KEY:-…}
     PUBLISH_REQUIRED_SCOPE: ${PUBLISH_REQUIRED_SCOPE:-api://ws-server/app:publisher}
+    # mint shaping (sub/channels/subs on /realtime/token) — who may use it:
+    MINT_SHAPING_SCOPE: ${MINT_SHAPING_SCOPE:-<PUBLISH_REQUIRED_SCOPE>}
+    MINT_MAX_SUBS: ${MINT_MAX_SUBS:-32}
+    # per-service channel separation (multi-tenant): <prefix>:<client_id>:*
+    SERVICE_CHANNEL_PREFIX: ${SERVICE_CHANNEL_PREFIX:-}
+    # group channel rewriting: group:<client_id>,<group> (prepend) or group:<group>,<client_id> (append)
+    GROUP_CLIENT_ID_POSITION: ${GROUP_CLIENT_ID_POSITION:-prepend}
+    GROUP_CLIENT_ID_DELIMITER: ${GROUP_CLIENT_ID_DELIMITER:-,}
     ALLOWED_API_METHODS: ${ALLOWED_API_METHODS:-}
     CONNECTION_TTL: ${CONNECTION_TTL:-300}
     # bundle contents (relayed to the SPA by the App server):
@@ -154,6 +162,18 @@ Interface:
 * `POST /realtime/token` with `Authorization: Bearer <IdP access token>` →
   `200 { connection: { url, token, channel, expires_in, subject }, minted_by,
   claims }` on success; `401/400` on bad token, `403` on policy failure.
+  Optional body (ONLY for callers holding `MINT_SHAPING_SCOPE` — the
+  app-server/M2M identities; user/SPA tokens get `403 insufficient_scope`):
+  * `sub` — mint on behalf of that user id (Centrifugo `sub` claim);
+  * `channels: ["group:42", …]` — server-side subscriptions: Centrifugo
+    subscribes the client to exactly these channels on connect;
+  * `subs: { "group:42": { data?, info?, override? } }` — same, with
+    per-channel options (welcome `data`, presence `info`, option overrides).
+    These claims are how **group membership is enforced**: pair them with a
+    namespace whose `allow_subscribe_for_client` is OFF (see the `group`
+    namespace in `centrifugo/config.json` / `centrifugo.sample.json`) — then
+    the mint is the only door into those channels, and the client cannot
+    subscribe to anything the app did not choose.
 * `POST /publish` — sugar over the generic proxy: builds the `{channel, data}`
   publish envelope from the verified identity; returns `{ ok, via,
   centrifugo_method: "publish", published, claims, centrifugo_response }`.
@@ -161,8 +181,11 @@ Interface:
 * `POST /centrifugo/:method` — generic relay for the per-method Centrifugo v6
   endpoints; the request body is forwarded verbatim. Policy:
   * method must appear in `ALLOWED_API_METHODS`
-    (default: publish, broadcast, presence, presence_stats, history,
-    channels, info, history_remove, unsubscribe, disconnect, batch);
+    (default: publish, broadcast, subscribe, unsubscribe, presence,
+    presence_stats, history, channels, info, history_remove, disconnect,
+    batch). `subscribe`/`unsubscribe` are the **runtime membership** ops —
+    they add/remove a connected user's sessions to/from a channel
+    server-side (INTEGRATION.md §1.2c);
   * state-changing methods additionally require `PUBLISH_REQUIRED_SCOPE`;
     read-only methods (`presence`/`history`/`channels`/`info`) only need to
     pass the base OAuth policy.
@@ -170,10 +193,13 @@ Interface:
 
 Semantics to rely on:
 
-* **origin fence**: browser-style `Origin` headers must match `ALLOWED_ORIGINS`
-  (Centrifugo-style glob, default `https://*.adolfrey.com` — one `*` = one
+* **origin fence + CORS**: browser-style `Origin` headers must match
+  `ALLOWED_ORIGINS` (Centrifugo-style glob, default `https://*.adolfrey.com` — one `*` = one
   subdomain label); server-to-server callers send no Origin header and pass
-  unconditionally. Blocked browsers get `403 origin_not_allowed`.
+  unconditionally. Allowed origins get CORS headers back (the origin echoed,
+  `Authorization`/`Content-Type` allowed, preflight answered with 204) so a
+  SPA can mint directly from the browser (INTEGRATION §2.2b). Blocked
+  browsers get `403 origin_not_allowed`.
 
 Semantics to rely on:
 

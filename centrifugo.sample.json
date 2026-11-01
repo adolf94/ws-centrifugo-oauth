@@ -22,6 +22,20 @@
       "join_leave": true
     }
   },
+  "namespaces": [
+    {
+      "name": "group",
+      "allow_subscribe_for_client": false,
+      "presence": true,
+      "join_leave": true
+    },
+    {
+      "name": "svc",
+      "allow_subscribe_for_client": false,
+      "presence": true,
+      "join_leave": true
+    }
+  ],
   "admin": {
     "enabled": false
   },

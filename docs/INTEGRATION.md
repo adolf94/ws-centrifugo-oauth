@@ -72,7 +72,8 @@ origin and scope on every call.
 
 This is your "negotiate" endpoint (the Azure Web PubSub equivalent of
 `generateClientAccessToken`) — token creation happens entirely on the
-Centrifugo side. Responsibilities, in order:
+Centrifugo side. (The SPA may also skip this hop and mint straight from the
+browser — see §2.2b.) Responsibilities, in order:
 
 1. **authenticate the publisher via OAuth** — verify the IdP Bearer access
    token against `JWKS_URL` and enforce the `REQUIRED_CLAIMS`/
@@ -112,6 +113,112 @@ In another language the same pattern is one HTTP call, e.g. Python:
 r = requests.post(PROXY_URL, headers={"Authorization": auth_header})
 bundle = r.json()["connection"]     # {url, token, channel, expires_in, subject}
 ```
+
+### 1.2b Restricting a client to its groups (server-side subscriptions)
+
+In Centrifugo a *channel is the group* — and the mechanism for "this client
+may only see these groups" is **server-side subscriptions**, decided at mint
+time:
+
+1. the `group` namespace in the Centrifugo config keeps
+   `allow_subscribe_for_client` **off** → client-initiated subscribes to
+   `group:*` are denied by the bus;
+2. at negotiate time your app decides the user's groups (from its own
+   database) and asks the wall to embed them in the connection token →
+   Centrifugo subscribes the client automatically upon connect. The SPA
+   never calls `subscribe()` for groups — the publications just start
+   arriving.
+
+The shaping call must come from an identity holding the wall's
+`MINT_SHAPING_SCOPE` — your app server's M2M (client_credentials) identity,
+**never** the public SPA client (a browser must not be able to self-select
+groups):
+
+```
+POST {proxy}/realtime/token
+Authorization: Bearer <the app server's service (M2M) token>
+{ "sub": "42", "subs": { "group:42": {}, "group:7": {} } }
+```
+
+(or the simpler `"channels": ["group:42", "group:7"]`; per-channel options
+`data`/`info`/`override` ride under each `subs` key.) The wall re-verifies
+the service token (JWKS + client allow-list + the shaping scope), embeds
+`sub`/`channels`/`subs` into the short-lived HS256 connection JWT, and
+answers with the usual bundle — now carrying `subject`, `channels` and
+`subs` — which you relay to the SPA exactly as in §1.2. On the SPA side
+*nothing changes*: `new Centrifuge(bundle.url, { token, getToken })` —
+group publications arrive right after connect, and subscribing to any
+channel the app did not choose is denied by the bus.
+
+> **Automatic `client_id` tagging for groups**: When referencing `group:*` channels
+> (e.g. `group:group-1`), the proxy automatically rewrites the channel name to include
+> the verified caller's `client_id` (e.g. `app-1`):
+> * Prepend (default): `group:app-1,group-1`
+> * Append (`GROUP_CLIENT_ID_POSITION=append`): `group:group-1,app-1`
+> 
+> This rewriting is applied identically to both `/realtime/token` minting (`channels` / `subs`)
+> and Server-API relays (`publish`, `broadcast`, `subscribe`, `unsubscribe`, `presence`, etc.),
+> keeping callers isolated by service identity without manual name formatting.
+
+Membership changes propagate on the next `getToken`/refresh cycle (re-mint
+with the fresh group list). Publishing **into** a group stays the server
+lane of §1.3: `POST {proxy}/broadcast {"channels":["group:42"],"data":…}`.
+
+### 1.2c Runtime membership: add/remove a *connected* user at any time
+
+Mint-time subs (§1.2b) apply at connect. For live changes — "user-a joined
+group-1 while connected" — Centrifugo's Server API has
+**`subscribe`/`unsubscribe`**, relayed by the wall exactly like every other
+method (publisher-scope-gated):
+
+```
+1. POST {proxy}/realtime/token   {"sub":"user-a"}        ← api mints for user-a
+2. SPA connects with the token (no groups yet)
+3. POST {proxy}/subscribe        {"user":"user-a","channel":"group:1"}
+4. POST {proxy}/broadcast        {"channels":["group:1"],"data":{…}}
+5. user-a receives the data ON THE LIVE CONNECTION — no reconnect, no
+   client-side subscribe call
+```
+
+`POST {proxy}/unsubscribe {"user":"user-a","channel":"group:1"}` removes the
+membership just as instantly (subsequent publishes to the channel are
+silent for that user). Optional params on `subscribe`: `expire_at`,
+`data`/`info`, per-connection targeting via `client`/`session`.
+
+Two things to know:
+
+* **SPA side, server-side subs emit on the Centrifuge instance, not on a
+  Subscription object**: `cf.on("publication", (ctx) => … ctx.channel …)`,
+  plus `cf.on("subscribed")` / `cf.on("unsubscribed")` for membership
+  bookkeeping. There is nothing to `subscribe()` from the client — and
+  attempts to self-subscribe to a group not granted by the server are
+  denied by the bus.
+* **API-subscribes are session-scoped**: they attach to the user's *current*
+  connections and do not survive a reconnect. Keep the group list's source
+  of truth in your app: mint with the current groups (§1.2b) so every
+  (re)connect starts correct, and use `subscribe`/`unsubscribe` for the
+  live deltas in between.
+
+### 1.2d Per-service channel separation (multi-tenant mode)
+
+Namespaces group channels by *feature*; to group them by *calling service*,
+turn on the wall's `SERVICE_CHANNEL_PREFIX` (e.g. `svc`, matching the `svc`
+namespace in the Centrifugo config). Every channel your service then names —
+publishing, broadcasting, subscribing users, mint shaping — must live under
+**its own verified identity**:
+
+```
+speedtest (client_id)  →  svc:speedtest:group1, svc:speedtest:alerts
+weather   (client_id)  →  svc:weather:dashboard
+```
+
+The middle segment is checked against the OAuth `client_id` the wall just
+verified cryptographically — a service cannot publish into, subscribe users
+to, or mint subscriptions for another service's channels
+(`403 service_channel_not_allowed`). The §1.2b/§1.2c group flows work
+unchanged in this mode; just name your channels inside your own prefix.
+Off by default (`SERVICE_CHANNEL_PREFIX` empty) — then any allow-listed
+channel is shared by all publisher services.
 
 ### 1.3 Publishing: `POST {proxy}/publish` (and any other Server API call)
 
@@ -228,6 +335,42 @@ What the SDK buys you (why not raw `WebSocket`):
   changes propagate on the next cycle);
 * per-subscription recovery/`offset` support if the channel has history enabled.
 
+### 2.2b Alternative: mint straight from the browser (no app relay)
+
+The wall re-verifies the Bearer itself, so the app-server hop of §1.2 is
+*optional* — a SPA can call the mint endpoint directly, exactly like an
+Azure client-token endpoint. The wall answers browser CORS preflights for
+origins that pass its fence:
+
+```js
+const WALL = "https://apis.adolfrey.com/websockets";
+
+async function negotiate() {
+  // bearer = the IdP access token your SPA already holds (PKCE login),
+  // the same one it uses for your own API calls.
+  const r = await fetch(`${WALL}/realtime/token`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${bearer}` },
+  });
+  if (!r.ok) throw new Error("mint rejected");
+  return (await r.json()).connection;   // { url, token, channel, expires_in, subject }
+}
+
+const cf = new Centrifuge(bundle.url, { token: bundle.token, getToken: negotiate });
+```
+
+Requirements and trade-offs:
+
+* the SPA's **origin** must be in the wall's `ALLOWED_ORIGINS`
+  (default `https://*.adolfrey.com` — any `*.adolfrey.com` SPA qualifies);
+* the SPA's OAuth **client_id** must be in the wall's `ALLOWED_CLIENT_IDS`;
+* the Bearer travels in the `Authorization` header — allowed by the wall's
+  CORS response, never as a query string;
+* the bundle is the **wall's** choice (channel = the proxy's `DEMO_CHANNEL`):
+  for per-user or per-group channels your app must shape the mint — see
+  §1.2b; browser tokens never carry the shaping scope, so this direct lane
+  is watch-only by construction;
+
 ### 2.3 Onboarding a user (storyline: OAuth)
 
 The supported storyline for real applications:
@@ -249,6 +392,7 @@ with `403 session_not_valid_with_proxy` / `403 session_cannot_publish`
 | Symptom | Cause | Fix |
 |---|---|---|
 | `connect` → `permission denied` (3501 on malformed frame) | protocol misuse | Use `centrifuge-js` |
+| SPA `subscribe("group:…")` → permission denied | expected: the `group` namespace forbids client-initiated subscribes — membership rides the minted token (§1.2b) | don't subscribe from the client; shape the mint (`channels`/`subs`) instead |
 | Negotiate works, connect → `permission denied` | mint/verify pairing broken on the Centrifugo side | deployment-level, not app-level: the issuing and verifying secrets must be one and the same (see the pairing table in [`CENTRIFUGO.md`](CENTRIFUGO.md)) — redeploy with a consistent `.env`; never bake anything into the SPA |
 | Browser call → `403 origin_not_allowed` | the SPA is served from an origin outside the sidecar's `ALLOWED_ORIGINS` (server-to-server callers send no Origin and always pass) | add the SPA's origin to `ALLOWED_ORIGINS` (glob: one `*` = one subdomain label) |
 | Publish → HTTP error or nothing sent | `error` relayed from Centrifugo | check the channel/namespace names (Centrifugo-side config); the X-API-Key pairing lives entirely on the Centrifugo side — see [`CENTRIFUGO.md`](CENTRIFUGO.md) |
