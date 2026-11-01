@@ -1,35 +1,25 @@
 # APP_DEPLOY via homelab gh_webhooks (docs/DEPLOY.md §4b).
+# Alignment invariant learned from the proven cron-agent pipeline:
+#   the POSTed `tag` must be one the build actually pushed.
+# metadata-action pushes `sha-<short7>` (type=sha, prefix=sha-) and the deploy
+# step POSTs exactly `sha-<short7>`.
 #
-# Builds the unified app+token-issuer image → pushes to GHCR (always) and, if
-# the repo variable DOCKERHUB_NAMESPACE is set, copies the same digests to
-# Docker Hub. Then POSTs an HMAC-signed payload to
-# https://apis.adolfrey.com/gh_webhooks/d — the webhook runs
-# `IMAGE=<tag> docker compose pull && docker compose up -d --no-deps` in
-# /srv/deploy/<name>/ on the homelab host.
+# Whitelist guidance (gh_webhooks/deploy_config.json):
+#   "image": "ghcr.io/<owner>/<repo>"   + POST tag "sha-<short7>"
 #
-# Tags pushed everywhere (identical bytes):
-#   <registry>/<ns>/<repo>:<full-sha>   — canonical (deploy POSTs this tag)
-#   <registry>/<ns>/<repo>:sha-<short7> — tolerated short style on the server
-#   <registry>/<ns>/<repo>:latest       — convenience for manual inspections
-#
-# Repo secrets:
-#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET — CF Access service token
-#   HOMELAB_WEBHOOK_SECRET                        — shared with gh_webhooks
-#   DOCKERHUB_USERNAME / DOCKERHUB_TOKEN          — hub mirror (optional)
-# Repo variable:
-#   DOCKERHUB_NAMESPACE (e.g. adolf94) — empty/unset ⇒ no hub push at all
-#
-# Whitelist guidance (gh_webhooks/deploy_config.json) — pick ONE ref scheme and
-# keep it aligned with a pushed tag:
-#   "image": "ghcr.io/<owner>/<repo>"        + POST tag "<full-sha>"
-#   "image": "docker.io/<DOCKERHUB_NS>/<repo>" + POST tag "<full-sha>"
+# Repo secrets: CF_ACCESS_CLIENT_ID/SECRET · HOMELAB_WEBHOOK_SECRET
 
-name: build & deploy
+name: Build & push ws-centrifugo-oauth image (GHCR)
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to homelab via webhook (push to GHCR always happens)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -39,94 +29,77 @@ concurrency:
   group: deploy-${{ github.repository }}
   cancel-in-progress: false
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # lowercased automatically by metadata-action
+
 jobs:
-  build-and-push:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: refs
-        env:
-          REPO_LC: ${{ github.repository }}
-        run: |
-          SHORT="${GITHUB_SHA:0:7}"
-          echo "ghcr_full=ghcr.io/${REPO_LC,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "ghcr_short=ghcr.io/${REPO_LC,,}:sha-${SHORT}" >> "$GITHUB_OUTPUT"
+      - name: Docker metadata (tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=ws-centrifugo-oauth
+            org.opencontainers.image.description=Realtime wall — OAuth-verified token-issuer sidecar (mint + Server-API proxy) and the Centrifugo v6 WS bus hosting layout.
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
+          file: ./server/Dockerfile
           push: true
-          tags: |
-            ${{ steps.refs.outputs.ghcr_full }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          platforms: linux/amd64
 
-      - name: extra tags (sha-<short7>, latest) via manifest copy
-        env:
-          GHCR_FULL: ${{ steps.refs.outputs.ghcr_full }}
-          GHCR_SHORT: ${{ steps.refs.outputs.ghcr_short }}
-        run: |
-          LATEST_TAG=$(echo "$GHCR_FULL" | sed -E "s/:.*$/:latest/")
-          docker buildx imagetools create -t "$GHCR_SHORT" -t "$LATEST_TAG" "$GHCR_FULL"
-          echo "pushed: $GHCR_SHORT $LATEST_TAG"
-
-  hub-mirror:
-    needs: build-and-push
-    # runs ONLY when the repo variable DOCKERHUB_NAMESPACE is set
-    if: ${{ vars.DOCKERHUB_NAMESPACE != '' }}
-    runs-on: ubuntu-latest
-    steps:
-      - env:
-          REPO_LC: ${{ github.repository }}
-        run: |
-          echo "hub_full=docker.io/${{ vars.DOCKERHUB_NAMESPACE }}/${REPO_LC,,}:${{ github.sha }}" >> "$GITHUB_ENV"
-          echo "hub_short=docker.io/${{ vars.DOCKERHUB_NAMESPACE }}/${REPO_LC,,}:sha-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
-          echo "ghcr_src=ghcr.io/${REPO_LC,,}:${{ github.sha }}" >> "$GITHUB_ENV"
-
-      - uses: docker/login-action@v3
-        with:
-          registry: docker.io
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-        run: |
-          echo "$DOCKERHUB_TOKEN" | docker login docker.io -u "$DOCKERHUB_USERNAME" --password-stdin
-          docker buildx imagetools create \
-            -t "$hub_full" \
-            -t "$hub_short" \
-            -t "docker.io/${{ vars.DOCKERHUB_NAMESPACE }}/${REPO_LC,,}:latest" \
-            "$ghcr_src"
-          echo "docker.io mirror ready: $hub_full · $hub_short"
+      - name: Image digest
+        run: echo "Pushed ${{ steps.meta.outputs.tags }} @ ${{ steps.build.outputs.digest }}"
 
   deploy:
-    needs: build-and-push
+    needs: build
+    if: github.event_name == 'push' || inputs.deploy == true
     runs-on: ubuntu-latest
     steps:
-      - env:
+      - name: Trigger homelab deploy webhook (gh_webhooks)
+        env:
           CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           HOOK_SECRET: ${{ secrets.HOMELAB_WEBHOOK_SECRET }}
         run: |
-          TAG="${{ github.sha }}"
+          # The pushed tag (metadata-action, type=sha,prefix=sha-) is sha-<short7>;
+          # POST the same format here or the webhook pulls a tag that doesn't exist.
+          TAG="sha-$(printf '%s' "${{ github.sha }}" | cut -c1-7)"
           BODY=$(jq -nc --arg repo "${{ github.repository }}" --arg tag "$TAG" '{repo:$repo, tag:$tag}')
           TS=$(date +%s)
           SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)
-          curl -sf --retry 3 --max-time 30 \
+          echo "Triggering webhook for ${BODY}"
+          curl --fail-with-body --show-error --retry 3 --retry-all-errors --max-time 30 \
+            --write-out '\nHTTP status: %{http_code}\n' \
             -H "CF-Access-Client-Id: $CLIENT_ID" \
             -H "CF-Access-Client-Secret: $CLIENT_SECRET" \
             -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
             -H "Content-Type: application/json" --data "$BODY" \
             https://apis.adolfrey.com/gh_webhooks/d
-          echo "deploy accepted: ${{ github.repository }} tag $TAG"
