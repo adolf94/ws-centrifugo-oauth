@@ -10,8 +10,6 @@
 name: build & deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -60,14 +58,17 @@ jobs:
           HOOK_SECRET: ${{ secrets.HOMELAB_WEBHOOK_SECRET }}
           IMAGE: ${{ needs.build-and-push.outputs.image }}
         run: |
-          TAG="${{ github.sha }}"
+          # GHCR gets tags like sha-<short7> (metadata-action, prefix=sha-); post
+          # the same format here or the webhook pulls a tag that doesn't exist
+          TAG="sha-$(printf '%s' "${{ github.sha }}" | cut -c1-7)"
           BODY=$(jq -nc --arg repo "${{ github.repository }}" --arg tag "$TAG" '{repo:$repo, tag:$tag}')
           TS=$(date +%s)
           SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$HOOK_SECRET" -r | cut -d' ' -f1)
-          curl -sf --retry 3 --max-time 30 \
+          echo "Triggering webhook for ${BODY}"
+          curl --fail-with-body --show-error --retry 3 --retry-all-errors --max-time 30 \
+            --write-out '\nHTTP status: %{http_code}\n' \
             -H "CF-Access-Client-Id: $CLIENT_ID" \
             -H "CF-Access-Client-Secret: $CLIENT_SECRET" \
             -H "X-Timestamp: $TS" -H "X-Signature: $SIG" \
             -H "Content-Type: application/json" --data "$BODY" \
             https://apis.adolfrey.com/gh_webhooks/d
-          echo "deploy accepted for $IMAGE (webhook runs compose pull + up -d --no-deps)"
