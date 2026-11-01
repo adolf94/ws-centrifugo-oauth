@@ -1,5 +1,5 @@
 /**
- * Token-issuer sidecar — the Centrifugo-side "wall" for every secret operation.
+ * Proxy sidecar — the Centrifugo-side "wall" for every secret operation.
  *
  * Trust flow (the "azure-like" scheme, but with minting AND publishing moved
  * to the Centrifugo side of the docker network):
@@ -9,7 +9,7 @@
  *                            │ POST /realtime/token  (mint)
  *                            │ POST /publish         (publish)
  *                            ▼  Authorization: Bearer <IdP token> both times
- *                         token-issuer: validates the PUBLISHER via OAuth
+ *                         proxy: validates the PUBLISHER via OAuth
  *                         (JWKS: signature + iss/aud/exp + REQUIRED_CLAIMS +
  *                         REQUIRED_SCOPES + ALLOWED_CLIENT_IDS) …
  *                            │ …then for mint: signs the HS256 connection JWT
@@ -231,7 +231,7 @@ function mintConnectionJwt({ subject, scopes, maxExp }) {
     sub: subject, // Centrifugo user id (Azure Web PubSub: userId)
     exp, // short-lived; the SPA refreshes through the same relayed hop
     iat: now,
-    info: { scopes: [...scopes], minted_by: 'token-issuer' },
+    info: { scopes: [...scopes], minted_by: 'proxy' },
   };
   const input = `${b64urlJson(header)}.${b64urlJson(claims)}`;
   const sig = crypto
@@ -255,7 +255,7 @@ app.use((req, res, next) => {
   if (req.path === '/healthz') return next();
   const origin = req.headers.origin;
   if (originAllowed(origin)) return next();
-  console.warn(`[issuer]   origin rejected: ${origin} ${req.method} ${req.path}`);
+  console.warn(`[proxy]   origin rejected: ${origin} ${req.method} ${req.path}`);
   return res.status(403).json({
     error: 'origin_not_allowed',
     detail: `origin "${origin}" is not in ALLOWED_ORIGINS (${ALLOWED_ORIGINS.join(', ')})`,
@@ -290,7 +290,7 @@ app.post('/realtime/token', async (req, res) => {
       expires_in: Math.max(0, minted.expiresAt - Math.floor(Date.now() / 1000)),
       subject,
     },
-    minted_by: 'token-issuer',
+    minted_by: 'proxy',
     claims: {
       sub: payload.sub ?? null,
       service_subject: payload.client_id ?? null,
@@ -337,7 +337,7 @@ function respondFromCentrifugo(res, method, { apiRes, body }, extras = {}) {
   }
   return res.json({
     ok: true,
-    via: 'token-issuer Server-API proxy → Centrifugo',
+    via: 'proxy Server-API proxy → Centrifugo',
     centrifugo_method: method,
     ...extras,
     centrifugo_response: body,
@@ -405,8 +405,12 @@ app.post('/publish', async (req, res) => {
 });
 
 /**
- * POST /centrifugo/:method — generic proxy for the Centrifugo v6 HTTP Server
- * API (per-method endpoints). The caller never sees X-API-Key. Policy:
+ * POST /centrifugo/:method  (canonical, for apps attached to the wall's
+ * `realtime` network) and POST /:method  (alias, for the public wall route
+ * where Caddy strips the /websockets prefix leaving one path element).
+ *
+ * Generic proxy for the Centrifugo v6 HTTP Server API (per-method
+ * endpoints). The caller never sees X-API-Key. Policy:
  *   • method must be in ALLOWED_API_METHODS;
  *   • state-changing methods additionally require PUBLISH_REQUIRED_SCOPE;
  *   • read-only methods (presence/history/channels/info) only need to pass
@@ -414,8 +418,11 @@ app.post('/publish', async (req, res) => {
  * The request body is forwarded verbatim, e.g.
  *   {"channel":"chat","data":{"text":"hello"}}   for method=publish
  *   {"channel":"chat"}                            for method=presence
+ * Registration order matters: POST /publish (the sugar, above) is matched
+ * before these param routes, so the public /publish always stays the
+ * identity-stamped sugar, never verbatim.
  */
-app.post('/centrifugo/:method', async (req, res) => {
+async function relayServerApiMethod(req, res) {
   const method = req.params.method;
   if (!ALLOWED_API_METHODS.includes(method)) {
     return res.status(404).json({
@@ -456,7 +463,14 @@ app.post('/centrifugo/:method', async (req, res) => {
       granted_scopes: [...scopes],
     },
   });
-});
+}
+
+// canonical route (attach-internal apps + world-visible docs use this too)
+app.post('/centrifugo/:method', relayServerApiMethod);
+// flat public wall alias: Caddy routes /websockets/<method> here with the
+// prefix stripped. Unknown method names are rejected with 404 unknown_method,
+// so this catch-all never becomes an open door.
+app.post('/:method', relayServerApiMethod);
 
 app.get('/healthz', (_req, res) => {
   res.json({
@@ -479,18 +493,18 @@ app.get('/healthz', (_req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`[issuer]   listening on http://localhost:${PORT} (internal only)`);
-  console.log(`[issuer]   JWKS:   ${JWKS_URL}`);
-  console.log(`[issuer]   issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
-  console.log(`[issuer]   allowed origins: ${ALLOWED_ORIGINS.join(', ')} (server-to-server callers pass without Origin)`);
-  console.log(`[issuer]   required scopes: ${REQUIRED_SCOPES.join(' ')}; publish scope: ${PUBLISH_REQUIRED_SCOPE}`);
-  console.log(`[issuer]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"`);
-  console.log(`[issuer]   Server-API proxy → ${CENTRIFUGO_API_URL} (X-API-Key held here only)`);
-  console.log(`[issuer]   proxyable methods: ${ALLOWED_API_METHODS.join(', ')}`);
+  console.log(`[proxy]   listening on http://localhost:${PORT} (internal only)`);
+  console.log(`[proxy]   JWKS:   ${JWKS_URL}`);
+  console.log(`[proxy]   issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
+  console.log(`[proxy]   allowed origins: ${ALLOWED_ORIGINS.join(', ')} (server-to-server callers pass without Origin)`);
+  console.log(`[proxy]   required scopes: ${REQUIRED_SCOPES.join(' ')}; publish scope: ${PUBLISH_REQUIRED_SCOPE}`);
+  console.log(`[proxy]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"`);
+  console.log(`[proxy]   Server-API proxy → ${CENTRIFUGO_API_URL} (X-API-Key held here only)`);
+  console.log(`[proxy]   proxyable methods: ${ALLOWED_API_METHODS.join(', ')}`);
   if (!CENTRIFUGO_TOKEN_HMAC) {
-    console.error('[issuer]   WARNING: CENTRIFUGO_TOKEN_HMAC is empty — every mint will fail until the secret is injected');
+    console.error('[proxy]   WARNING: CENTRIFUGO_TOKEN_HMAC is empty — every mint will fail until the secret is injected');
   }
   if (!CENTRIFUGO_API_KEY) {
-    console.error('[issuer]   WARNING: CENTRIFUGO_API_KEY is empty — every publish will fail until the key is injected');
+    console.error('[proxy]   WARNING: CENTRIFUGO_API_KEY is empty — every publish will fail until the key is injected');
   }
 });

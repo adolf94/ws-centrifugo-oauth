@@ -17,7 +17,7 @@
  *
  *  2. Publisher relay:
  *       POST /publish  — forwards the publisher's Bearer token to the
- *       token-issuer sidecar, which enforces the publish scope and holds
+ *       proxy sidecar, which enforces the publish scope and holds
  *       the only X-API-Key to Centrifugo's HTTP Server API. This app holds
  *       no Centrifugo secrets. Requires an IdP token with the publish scope.
  *
@@ -105,15 +105,15 @@ const REQUIRED_SCOPES = String(process.env.REQUIRED_SCOPES || '')
 //   'oauth' — the IdP access token is passed through as the connection JWT
 //             and Centrifugo verifies it via JWKS.
 const CONNECTION_TOKEN_MODE = process.env.CONNECTION_TOKEN_MODE || 'hmac';
-// The HMAC secret is held by the token-issuer sidecar (Centrifugo side), not
+// The HMAC secret is held by the proxy sidecar (Centrifugo side), not
 // by this app. Empty = this app cannot mint locally by design; minting is
-// delegated to TOKEN_ISSUER_URL below.
+// delegated to PROXY_URL below.
 const CENTRIFUGO_TOKEN_HMAC = process.env.CENTRIFUGO_TOKEN_HMAC || '';
-// Token-issuer sidecar (minting wall on the Centrifugo side): full endpoint
+// Proxy sidecar (minting wall on the Centrifugo side): full endpoint
 // of POST /realtime/token. When set, /realtime/connection relays the verified
 // Bearer token there and forwards the issued bundle to the SPA instead of
 // minting locally.
-const TOKEN_ISSUER_URL = process.env.TOKEN_ISSUER_URL || '';
+const PROXY_URL = process.env.PROXY_URL || '';
 const CONNECTION_TTL = parseInt(process.env.CONNECTION_TTL || '300', 10);
 
 // ── App-level session (the SPA's login when OAuth is not used for users) ──
@@ -125,7 +125,7 @@ const SESSION_SECRET =
   process.env.SESSION_SECRET || 'demo-session-secret-change-me';
 const SESSION_TTL = parseInt(process.env.SESSION_TTL || '28800', 10); // 8h
 
-// Scope gate for publications: enforced by the token-issuer sidecar, sitting
+// Scope gate for publications: enforced by the proxy sidecar, sitting
 // in FRONT of Centrifugo's X-API-Key-protected /api door (Centrifugo OSS
 // HTTP API cannot read scopes itself). This app holds no publish credential.
 const CENTRIFUGO_PUBLIC_WS_URL =
@@ -133,12 +133,12 @@ const CENTRIFUGO_PUBLIC_WS_URL =
 // Demo channel the App server manages (server API publishes here).
 const DEMO_CHANNEL = process.env.DEMO_CHANNEL || 'chat';
 // Publishing is relayed through the same sidecar that mints the connection
-// tokens: the base URL derives from TOKEN_ISSUER_URL (…/realtime/token → …).
-function tokenIssuerBase() {
-  return TOKEN_ISSUER_URL.replace(/\/realtime\/token\/?$/, '');
+// tokens: the base URL derives from PROXY_URL (…/realtime/token → …).
+function proxyBase() {
+  return PROXY_URL.replace(/\/realtime\/token\/?$/, '');
 }
 function publishEndpoint() {
-  return `${tokenIssuerBase()}/publish`;
+  return `${proxyBase()}/publish`;
 }
 
 
@@ -461,7 +461,7 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
 
   // Connection JWT per active mode:
   //   MODE issuer (target architecture): relay the verified IdP token to the
-  //     token-issuer sidecar on the Centrifugo side — it re-verifies it via
+  //     proxy sidecar on the Centrifugo side — it re-verifies it via
   //     JWKS and mints the HS256 connection JWT. This app never holds the
   //     HMAC secret.
   //   MODE A (hmac, offline fallback): mint a fresh short-lived Centrifugo
@@ -471,31 +471,31 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
   let token;
   let expiresAt;
   let detail;
-  if (TOKEN_ISSUER_URL) {
+  if (PROXY_URL) {
     if (viaSession) {
       return res.status(403).json({
-        error: 'session_not_valid_with_token_issuer',
-        detail: 'the token-issuer sidecar validates publishers via OAuth (IdP) only — sign in at the IdP instead of the demo session',
+        error: 'session_not_valid_with_proxy',
+        detail: 'the proxy sidecar validates publishers via OAuth (IdP) only — sign in at the IdP instead of the demo session',
       });
     }
     let issuerResponse;
     let issuerBody;
     try {
-      issuerResponse = await fetch(TOKEN_ISSUER_URL, {
+      issuerResponse = await fetch(PROXY_URL, {
         method: 'POST',
         headers: { Authorization: req.headers.authorization },
       });
       issuerBody = await issuerResponse.json().catch(() => null);
     } catch (err) {
       return res.status(502).json({
-        error: 'token_issuer_unreachable',
-        detail: `${TOKEN_ISSUER_URL}: ${err instanceof Error ? err.message : String(err)}`,
+        error: 'proxy_unreachable',
+        detail: `${PROXY_URL}: ${err instanceof Error ? err.message : String(err)}`,
       });
     }
     if (!issuerResponse.ok) {
       return res.status(issuerResponse.status).json({
-        error: 'token_issuer_error',
-        detail: 'the token-issuer sidecar rejected the mint request',
+        error: 'proxy_error',
+        detail: 'the proxy sidecar rejected the mint request',
         body: issuerBody,
       });
     }
@@ -505,7 +505,7 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
     if (!CENTRIFUGO_TOKEN_HMAC) {
       return res.status(503).json({
         error: 'misconfigured',
-        detail: 'CONNECTION_TOKEN_MODE=hmac and no TOKEN_ISSUER_URL set — provide the token-issuer sidecar URL or inject CENTRIFUGO_TOKEN_HMAC for the local-mint fallback',
+        detail: 'CONNECTION_TOKEN_MODE=hmac and no PROXY_URL set — provide the proxy sidecar URL or inject CENTRIFUGO_TOKEN_HMAC for the local-mint fallback',
       });
     }
     const minted = mintConnectionJwt({
@@ -549,7 +549,7 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
   });
 });
 
-// ── 2) Publisher relay to the token-issuer sidecar ─────────────────────────
+// ── 2) Publisher relay to the proxy sidecar ─────────────────────────
 // The sidecar fronts Centrifugo's X-API-Key-protected HTTP Server API: it
 // re-verifies the Bearer token, enforces the publish scope, and forwards the
 // publication. This app holds NO Centrifugo secret — it is a pure relay.
@@ -560,16 +560,16 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
 //     in their real session/permission model instead of this demo default).
 app.post('/publish', requireUserAuth, async (req, res, next) => {
   const { payload, viaSession } = res.locals.auth;
-  if (!TOKEN_ISSUER_URL) {
+  if (!PROXY_URL) {
     return res.status(503).json({
       error: 'misconfigured',
-      detail: 'publishing requires the token-issuer sidecar (TOKEN_ISSUER_URL) — the X-API-Key no longer lives in this app',
+      detail: 'publishing requires the proxy sidecar (PROXY_URL) — the X-API-Key no longer lives in this app',
     });
   }
   if (viaSession) {
     return res.status(403).json({
       error: 'session_cannot_publish',
-      detail: 'the token-issuer sidecar validates publishers via OAuth (IdP) only — publish with an IdP token (or the M2M service identity)',
+      detail: 'the proxy sidecar validates publishers via OAuth (IdP) only — publish with an IdP token (or the M2M service identity)',
     });
   }
 
@@ -592,8 +592,8 @@ app.post('/publish', requireUserAuth, async (req, res, next) => {
 
     if (!proxyRes.ok) {
       return res.status(proxyRes.status).json({
-        error: body?.error || 'token_issuer_error',
-        detail: body?.detail || `token-issuer responded ${proxyRes.status}`,
+        error: body?.error || 'proxy_error',
+        detail: body?.detail || `proxy responded ${proxyRes.status}`,
         body,
       });
     }
@@ -654,10 +654,10 @@ app.post('/service/publish', async (req, res, next) => {
       .split(/[\s,]+/)
       .filter(Boolean);
 
-    if (!TOKEN_ISSUER_URL) {
+    if (!PROXY_URL) {
       return res.status(503).json({
         error: 'misconfigured',
-        detail: 'publishing requires the token-issuer sidecar (TOKEN_ISSUER_URL) — the X-API-Key no longer lives in this app',
+        detail: 'publishing requires the proxy sidecar (PROXY_URL) — the X-API-Key no longer lives in this app',
       });
     }
 
@@ -677,8 +677,8 @@ app.post('/service/publish', async (req, res, next) => {
     const body = await proxyRes.json().catch(() => null);
     if (!proxyRes.ok) {
       return res.status(proxyRes.status).json({
-        error: body?.error || 'token_issuer_error',
-        detail: body?.detail || `token-issuer responded ${proxyRes.status}`,
+        error: body?.error || 'proxy_error',
+        detail: body?.detail || `proxy responded ${proxyRes.status}`,
         hint: body?.error === 'insufficient_scope'
           ? `grant the publish scope to the ${SERVICE_CLIENT_ID} client at the IdP or set AUTH_SERVICE_SCOPES (granted: ${granted.join(' ')})`
           : undefined,
@@ -708,8 +708,8 @@ app.get('/healthz', (_req, res) => {
     expected_audience: AUDIENCE.length ? AUDIENCE : null,
     required_claims: REQUIRED_CLAIMS,
     required_scopes: REQUIRED_SCOPES,
-    token_issuer_url: TOKEN_ISSUER_URL || null,
-    publish_proxy_url: TOKEN_ISSUER_URL ? publishEndpoint() : null,
+    proxy_url: PROXY_URL || null,
+    publish_proxy_url: PROXY_URL ? publishEndpoint() : null,
     client_credentials: {
       client_id: SERVICE_CLIENT_ID,
       auth_method: SERVICE_CLIENT_SECRET ? 'client_secret_post' : 'none',
@@ -721,8 +721,8 @@ app.get('/healthz', (_req, res) => {
     },
     connection_token_mode: CONNECTION_TOKEN_MODE,
     connection_token_detail:
-      TOKEN_ISSUER_URL
-        ? 'Minting delegated to the token-issuer sidecar on the Centrifugo side — this app relays the issued bundle and holds no HMAC secret'
+      PROXY_URL
+        ? 'Minting delegated to the proxy sidecar on the Centrifugo side — this app relays the issued bundle and holds no HMAC secret'
         : CONNECTION_TOKEN_MODE === 'hmac'
           ? 'App server mints HS256 connection JWTs locally (azure pub-sub pattern; requires CENTRIFUGO_TOKEN_HMAC)'
           : 'IdP access tokens are verified by Centrifugo directly (JWKS)',
@@ -742,8 +742,8 @@ app.listen(PORT, () => {
   console.log(`[app]      issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
   console.log(`[app]      required claims: ${REQUIRED_CLAIMS.join(', ')}`);
   console.log(`[app]      required scopes: ${REQUIRED_SCOPES.join(' ')}`);
-  console.log(`[app]      publish via:     ${TOKEN_ISSUER_URL ? `${publishEndpoint()} (sidecar holds the X-API-Key)` : '(unset — publishing disabled)'}`);
-  console.log(`[app]      token issuer:    ${TOKEN_ISSUER_URL || '(unset — local mint fallback)'}`);
+  console.log(`[app]      publish via:     ${PROXY_URL ? `${publishEndpoint()} (sidecar holds the X-API-Key)` : '(unset — publishing disabled)'}`);
+  console.log(`[app]      proxy:    ${PROXY_URL || '(unset — local mint fallback)'}`);
   console.log(`[app]      OAuth (PKCE):    ${AUTH_AUTHORIZE_URL} client_id=${AUTH_CLIENT_ID}`);
-  console.log(`[app]      connection JWTs: ${TOKEN_ISSUER_URL ? 'minted by the token-issuer sidecar (this app holds no HMAC secret)' : CONNECTION_TOKEN_MODE === 'hmac' ? 'minted locally by this app server (HS256, azure-like)' : 'IdP access tokens passed through (JWKS)'}`);
+  console.log(`[app]      connection JWTs: ${PROXY_URL ? 'minted by the proxy sidecar (this app holds no HMAC secret)' : CONNECTION_TOKEN_MODE === 'hmac' ? 'minted locally by this app server (HS256, azure-like)' : 'IdP access tokens passed through (JWKS)'}`);
 });

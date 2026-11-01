@@ -1,5 +1,5 @@
 {
-  "name": "centrifugo-token-issuer",
+  "name": "centrifugo-proxy",
   "version": "1.0.0",
   "description": "Mint-issuer sidecar (Centrifugo side): validates publishers via OAuth (JWKS) and mints Centrifugo connection JWTs — the app server never holds the HMAC secret",
   "private": true,

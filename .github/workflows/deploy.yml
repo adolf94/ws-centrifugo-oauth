@@ -60,7 +60,7 @@ jobs:
             type=ref,event=branch
           labels: |
             org.opencontainers.image.title=ws-centrifugo-oauth
-            org.opencontainers.image.description=Realtime wall — OAuth-verified token-issuer sidecar (mint + Server-API proxy) and the Centrifugo v6 WS bus hosting layout.
+            org.opencontainers.image.description=Realtime wall — OAuth-verified proxy sidecar (mint + Server-API proxy) and the Centrifugo v6 WS bus hosting layout.
 
       - name: Build and push
         id: build

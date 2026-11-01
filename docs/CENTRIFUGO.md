@@ -13,7 +13,7 @@ permissions and its own operational surface.
 * Config file mounted read-only: `./centrifugo/config.json:/centrifugo/config.json:ro`
   (see `docker-compose.yml`).
 * Secrets are injected **by environment variables**, not baked into `config.json`.
-* `token-issuer` sidecar (Node, no published ports) — the secret wall of
+* `proxy` sidecar (Node, no published ports) — the secret wall of
   this side: OAuth-validates every caller, mints HS256 connection JWTs, and
   generically proxies the Centrifugo Server API — the single X-API-Key
   holder besides Centrifugo itself (§2c).
@@ -38,8 +38,8 @@ Key pairing to keep straight:
 
 | Variable | Direction | Note |
 |---|---|---|
-| `CENTRIFUGO_TOKEN_HMAC_SECRET` | .env → **centrifugo** (as `CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY`) and → **token-issuer sidecar** (its `CENTRIFUGO_TOKEN_HMAC`) | must be **identical on both** — or connects fail with `permission denied`. The App server receives it **never**: it asks the sidecar to mint |
-| `CENTRIFUGO_HTTP_API_KEY` | .env → centrifugo and → token-issuer sidecar (its `CENTRIFUGO_API_KEY`) | must match or publishes relay back as `centrifugo_api_error`; the App server receives it **never** — it Bearer-authenticates to the sidecar's proxy |
+| `CENTRIFUGO_TOKEN_HMAC_SECRET` | .env → **centrifugo** (as `CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY`) and → **proxy sidecar** (its `CENTRIFUGO_TOKEN_HMAC`) | must be **identical on both** — or connects fail with `permission denied`. The App server receives it **never**: it asks the sidecar to mint |
+| `CENTRIFUGO_HTTP_API_KEY` | .env → centrifugo and → proxy sidecar (its `CENTRIFUGO_API_KEY`) | must match or publishes relay back as `centrifugo_api_error`; the App server receives it **never** — it Bearer-authenticates to the sidecar's proxy |
 
 Define both in `.env` once — never duplicate the values in `config.json` and
 compose at the same time.
@@ -70,10 +70,10 @@ app:
     AUTH_SERVICE_CLIENT_ID: ${AUTH_SERVICE_CLIENT_ID:-…}
     AUTH_SERVICE_CLIENT_SECRET: ${AUTH_SERVICE_CLIENT_SECRET:-}
     AUTH_SERVICE_SCOPES: ${AUTH_SERVICE_SCOPES:-api://ws-server/app:publisher}
-    # All Centrifugo hops go through the token-issuer sidecar — the app
+    # All Centrifugo hops go through the proxy sidecar — the app
     # sends Bearer tokens only (mint: /realtime/token, publish: /publish,
     # any other Server API method: /centrifugo/:method). No X-API-Key here.
-    TOKEN_ISSUER_URL: ${TOKEN_ISSUER_URL:-http://token-issuer:4000/realtime/token}
+    PROXY_URL: ${PROXY_URL:-http://proxy:4000/realtime/token}
     # offline-only fallbacks (no sidecar configured):
     CENTRIFUGO_PUBLIC_WS_URL: ${CENTRIFUGO_PUBLIC_WS_URL:-ws://localhost:8000/connection/websocket}
     CONNECTION_TOKEN_MODE: ${CONNECTION_TOKEN_MODE:-hmac}
@@ -83,9 +83,9 @@ app:
     SESSION_TTL: ${SESSION_TTL:-28800}
 ```
 
-### 2c · `token-issuer` sidecar — the wall for every Centrifugo secret op
+### 2c · `proxy` sidecar — the wall for every Centrifugo secret op
 
-A small Node service (`token-issuer/`, no published ports — compose-network
+A small Node service (`proxy/`, no published ports — compose-network
 only) that owns minting AND every Server-API call, literally on the
 Centrifugo side:
 
@@ -95,9 +95,9 @@ SPA ── OAuth Bearer ──► App server (publisher)
                           │ POST /publish                           (publish sugar)
                           │ POST /centrifugo/:method                (any Server API call)
                           ▼   Authorization: Bearer <IdP token> — always
-                       token-issuer ── validates via JWKS (iss/aud/exp,
+                       proxy ── validates via JWKS (iss/aud/exp,
                                      REQUIRED_CLAIMS/SCOPES, ALLOWED_CLIENT_IDS)
-                       token-issuer ── mint:       signs the HS256 connection JWT
+                       proxy ── mint:       signs the HS256 connection JWT
                                                    (sub = the VERIFIED subject)
                                       publish:    enforces the publish scope
                                                   and injects the ONE X-API-Key
@@ -113,10 +113,20 @@ against the IdP here. Centrifugo OSS's HTTP API can only authenticate with
 `X-API-Key`, so a scope gate must sit *in front of that door*: this sidecar
 is exactly that gate.
 
+Public face (prod): these paths are the wall's **internal** door
+(`http://proxy:4000` on the `realtime` network). The browser-facing wall is
+`https://apis.adolfrey.com/websockets/*`; Caddy strips that prefix so the
+public URLs are flat — `/realtime/token` (mint), `/publish` (the sugar) and
+`/<method>` for every other allow-listed Server API call (e.g.
+`https://apis.adolfrey.com/websockets/history`). The bus-front paths
+`/websockets/connection|/emulation` go **directly** to Centrifugo, and
+Centrifugo's own `/api` + `/admin` have no public route at all (see
+`deploy/docker-compose.yml`'s Caddy block).
+
 Environment (injected entry point of exactly what the app reaches):
 
 ```yaml
-token-issuer:
+proxy:
   environment:
     PORT: 4000
     # OAuth validation of the publisher (same IdP as the App server):
@@ -171,7 +181,7 @@ Semantics to rely on:
   taken from the token just verified, never from a request body;
 * the sidecar's token policy is the same allow-list as the App server's —
   dev-only app sessions (HMAC cookies) are meaningless here, so the app
-  refuses session users in this mode with `session_not_valid_with_token_issuer`;
+  refuses session users in this mode with `session_not_valid_with_proxy`;
 * every proxied call is re-verified here — a compromised app cannot mint or
   publish for anyone it could not authenticate to the IdP itself;
 * if you ever need multiple issuers, give each its own key and switch

@@ -7,8 +7,7 @@
   },
   "client": {
     "allowed_origins": [
-      "https://realtime.your-domain.tld",
-      "https://spa.your-domain.tld"
+      "https://<spa-host>"
     ],
     "disallow_anonymous_connection_tokens": true,
     "token": {}

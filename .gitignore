@@ -20,3 +20,5 @@ Thumbs.db
 auth-keys/
 data/
 tmp/
+/deploy/
+deploy/

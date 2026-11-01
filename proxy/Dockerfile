@@ -3,12 +3,12 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Install dependencies first (better layer caching).
-COPY token-issuer/package.json /app/token-issuer/package.json
-WORKDIR /app/token-issuer
+COPY proxy/package.json /app/proxy/package.json
+WORKDIR /app/proxy
 RUN npm install --omit=dev --no-audit --no-fund
 
 # App code.
-COPY token-issuer /app/token-issuer
+COPY proxy /app/proxy
 
 ENV PORT=4000 \
     JWKS_URL=https://auth.adolfrey.com/api/.well-known/jwks.json \

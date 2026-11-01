@@ -1,8 +1,8 @@
 # UNIFIED image: the App API (.env-driven negotiate/publish relay) AND the
-# token-issuer sidecar share ONE built image — used by prod compose where a
+# proxy sidecar share ONE built image — used by prod compose where a
 # gh_webhooks deploy injects a single ${IMAGE} and selects the process via
-# `command:` (app: default CMD @ /app/server · issuer: node /app/token-issuer/server.js).
-# The dev compose still has per-service Dockerfiles (server/, token-issuer/).
+# `command:` (app: default CMD @ /app/server · issuer: node /app/proxy/server.js).
+# The dev compose still has per-service Dockerfiles (server/, proxy/).
 FROM node:20-alpine
 
 WORKDIR /app
@@ -12,17 +12,17 @@ COPY server/package.json /app/server/package.json
 WORKDIR /app/server
 RUN npm install --omit=dev --no-audit --no-fund
 
-# …then token-issuer deps.
+# …then proxy deps.
 WORKDIR /app
-COPY token-issuer/package.json /app/token-issuer/package.json
-WORKDIR /app/token-issuer
+COPY proxy/package.json /app/proxy/package.json
+WORKDIR /app/proxy
 RUN npm install --omit=dev --no-audit --no-fund
 
 # App code + the browser demo client to serve as static files.
 WORKDIR /app
 COPY server /app/server
 COPY client /app/client
-COPY token-issuer /app/token-issuer
+COPY proxy /app/proxy
 
 ENV JWKS_URL=https://auth.adolfrey.com/api/.well-known/jwks.json \
     AUTH_ISSUER=https://auth.adolfrey.com/api \
@@ -43,12 +43,12 @@ ENV JWKS_URL=https://auth.adolfrey.com/api/.well-known/jwks.json \
     CENTRIFUGO_PUBLIC_WS_URL="ws://localhost:8000/connection/websocket" \
     DEMO_CHANNEL=chat \
     CONNECTION_TOKEN_MODE=hmac \
-    TOKEN_ISSUER_URL=http://token-issuer:4000/realtime/token \
+    PROXY_URL=http://proxy:4000/realtime/token \
     CONNECTION_TTL=300 \
     SESSION_SECRET=demo-session-secret-change-me \
     SESSION_TTL=28800
 # NOTE: no issuer-side ENV defaults here on purpose — prod compose passes the
-# token-issuer's own environment (CENTRIFUGO_TOKEN_HMAC, CENTRIFUGO_API_KEY…)
+# proxy's own environment (CENTRIFUGO_TOKEN_HMAC, CENTRIFUGO_API_KEY…)
 # explicitly per service; sharing one image must never share one env.
 
 WORKDIR /app/server

@@ -11,8 +11,8 @@ for the visual picture `viz/architecture.svg`.
 | Component | Needs a library? | What |
 |---|---|---|
 | SPA (browser) | **Yes — one:** [`centrifuge-js`](https://www.npmjs.com/package/centrifuge) v5 | Handles the WS protocol, auto-reconnect with backoff, subscribe/recovery, ping/pong, and the **token refresh** calling your negotiate endpoint. Plain `WebSocket` loses all of that — don't reimplement it. |
-| App server (publisher) | **No** | Publishing is one `HTTP POST` to the token-issuer sidecar's `/publish` with the publisher's Bearer token — the app sends no API key and holds no Centrifugo secret. Any HTTP client works. |
-| Minting connection JWTs | **Not your app's job** | the Centrifugo-side token-issuer mints; see [`CENTRIFUGO.md`](CENTRIFUGO.md) §2c |
+| App server (publisher) | **No** | Publishing is one `HTTP POST` to the proxy sidecar's `/publish` with the publisher's Bearer token — the app sends no API key and holds no Centrifugo secret. Any HTTP client works. |
+| Minting connection JWTs | **Not your app's job** | the Centrifugo-side proxy mints; see [`CENTRIFUGO.md`](CENTRIFUGO.md) §2c |
 
 ---
 
@@ -26,7 +26,7 @@ Target trust model:
   `client_credentials` service identity.
 * **SPA gets its connection token minted by the Centrifugo side (Azure-like).**
   After OAuth verification, your app *requests* a short-lived connection JWT
-  from the token-issuer sidecar and relays the bundle to the SPA.
+  from the proxy sidecar and relays the bundle to the SPA.
 * **Authentication vs authorization are separate fences.** Mints are
   *authentication only* — a valid token from an allowed client is enough;
   **publishing** is gated by the publisher scope
@@ -42,11 +42,31 @@ Configuration comes from the deployment environment
 | What for | Env vars read |
 |---|---|
 | Verifying publishers via OAuth | `JWKS_URL`, `AUTH_ISSUER`, `AUTH_AUDIENCE`, `REQUIRED_CLAIMS`, `ALLOWED_CLIENT_IDS` — plus an *optional* blanket scope floor via `REQUIRED_SCOPES` (empty by default = token validation only) |
-| **All Centrifugo hops** (mint relay, `/publish`, generic `/centrifugo/:method`) | `TOKEN_ISSUER_URL` — endpoint of the token-issuer sidecar |
-| Offline-only fallbacks when the sidecar is absent | `CENTRIFUGO_PUBLIC_WS_URL`, `CONNECTION_TOKEN_MODE`, `CONNECTION_TTL` |
+| **All Centrifugo hops** (mint relay, `/publish`, generic `/centrifugo/:method`) | `PROXY_URL` — endpoint of the proxy sidecar (…/realtime/token) |
+| The channel handed out in the bundle | `DEMO_CHANNEL` — read by **both** sides: the proxy's value decides the sidecar-minted bundle, the app's only the offline fallback's |
+| Offline-only fallbacks when the sidecar is absent | `CONNECTION_TOKEN_MODE` (`hmac` local-mint needs `CENTRIFUGO_TOKEN_HMAC`; `oauth` passes the IdP token through), `CONNECTION_TTL`, `CENTRIFUGO_PUBLIC_WS_URL` |
 | Dev-only demo session (optional) | `SESSION_SECRET`, `SESSION_TTL` |
 
-If an expected variable is missing, fail fast at startup.
+Misconfiguration is surfaced per-request, not at boot: with `PROXY_URL` unset
+the mint falls back to the local modes and `/publish` answers
+`503 misconfigured` ("the X-API-Key no longer lives in this app") — point
+`PROXY_URL` at the sidecar and both clear.
+
+**Where the wall lives in prod.** Your app has two ways to reach the sidecar,
+and the SPA never hardcodes anything (the minted `bundle.url` carries the WS
+location). The public `/websockets` prefix is path-stripped at the wall,
+so the sidecar's canonical paths below work from both doors:
+
+| Need | Attached to the wall's `realtime` network | From anywhere else (over TLS) |
+|---|---|---|
+| Mint relay | `http://proxy:4000/realtime/token` | `https://apis.adolfrey.com/websockets/realtime/token` |
+| Publish | `http://proxy:4000/publish` | `https://apis.adolfrey.com/websockets/publish` |
+| Other Server API method | `http://proxy:4000/centrifugo/<method>` | `https://apis.adolfrey.com/websockets/<method>` |
+| WS the SPA opens | `bundle.url` | `wss://apis.adolfrey.com/websockets/connection/websocket` |
+
+Centrifugo's own `/api` is **not** publicly reachable (`404`): the only road
+to the Server API surface is the sidecar, which re-checks your Bearer token,
+origin and scope on every call.
 
 ### 1.2 Endpoint the SPA calls: `POST /realtime/connection`
 
@@ -59,39 +79,44 @@ Centrifugo side. Responsibilities, in order:
    `ALLOWED_CLIENT_IDS` policy. This is *token validation only*: no scope is
    required to watch (`REQUIRED_SCOPES` stays empty by default);
 2. **request the connection bundle** — forward the verified Bearer token to
-   the token-issuer sidecar (`TOKEN_ISSUER_URL`); the sidecar answers with the
+   the proxy sidecar (`PROXY_URL`); the sidecar answers with the
    ready-to-use bundle (subject = the verified identity, short-lived expiry);
-3. **relay the bundle** `{url, token, channel, expires_in}` back to the SPA
-   — it must never learn any secret or hardcode the WS URL.
+3. **relay the bundle** `{url, token, channel, expires_in, subject}` back to
+   the SPA — it must never learn any secret or hardcode the WS URL.
 
 ```js
 app.post('/realtime/connection', requireUserAuth, async (req, res) => {
   // requireUserAuth has already verified the IdP Bearer token via JWKS.
-  // Minting is delegated: forward the token to the Centrifugo-side issuer.
-  const issuerResponse = await fetch(TOKEN_ISSUER_URL, {
-    method: 'POST',
-    headers: { Authorization: req.headers.authorization },   // forward the verified Bearer
-  });
-  const body = await issuerResponse.json();                  // { connection: { url, token, channel, expires_in, subject } }
-  if (!issuerResponse.ok) return res.status(issuerResponse.status).json({ error: 'token_issuer_error', body });
+  // Minting is delegated: forward the token to the Centrifugo-side proxy.
+  let issuerResponse;
+  try {
+    issuerResponse = await fetch(PROXY_URL, {
+      method: 'POST',
+      headers: { Authorization: req.headers.authorization },   // forward the verified Bearer
+    });
+  } catch (err) {
+    return res.status(502).json({ error: 'proxy_unreachable', detail: String(err) });
+  }
+  const body = await issuerResponse.json().catch(() => null);  // { connection: { url, token, channel, expires_in, subject }, minted_by, claims }
+  if (!issuerResponse.ok) return res.status(issuerResponse.status).json({ error: 'proxy_error', body });
   return res.json({ ...body, relayed_by: 'app-server' });
 });
 ```
 
-(If the issuer is unreachable you get `502 token_issuer_unreachable`; if the
+(If the issuer is unreachable you get `502 proxy_unreachable`; if the
 IdP token fails the issuer's own policy re-check you get its `401/403` relayed.)
 
 In another language the same pattern is one HTTP call, e.g. Python:
 
 ```python
-r = requests.post(TOKEN_ISSUER_URL, headers={"Authorization": auth_header})
+r = requests.post(PROXY_URL, headers={"Authorization": auth_header})
 bundle = r.json()["connection"]     # {url, token, channel, expires_in, subject}
 ```
 
-### 1.3 Publishing: `POST {token-issuer}/publish` (and any other Server API call)
+### 1.3 Publishing: `POST {proxy}/publish` (and any other Server API call)
 
 ```
-POST {TOKEN_ISSUER_URL, sans /realtime/token}/publish
+POST {PROXY_URL, sans /realtime/token}/publish
 Authorization: Bearer <the verified publisher's IdP token>
 {"message": "hello from user 42"}
 ```
@@ -99,19 +124,21 @@ Authorization: Bearer <the verified publisher's IdP token>
 * **No `X-API-Key` anywhere in your app** — the sidecar is its single holder
   and injects it when relaying into Centrifugo's `/api/publish`.
 * The publish **scope** is enforced sidecar-side (Centrifugo OSS's API cannot
-  read scopes itself); you get its `403 insufficient_scope` relayed.
+  read scopes itself): a token without it gets `403 insufficient_scope` with
+  the granted scopes echoed back.
 * Any other Server API method works the same way:
   `POST …/centrifugo/<method>` with the same Bearer header and the method's
   JSON body forwarded verbatim (method allow-list + read-vs-write scope
-  policy documented in [`CENTRIFUGO.md`](CENTRIFUGO.md) §2c).
+  policy documented in [`CENTRIFUGO.md`](CENTRIFUGO.md) §2c); unknown method
+  names get `404 unknown_method` with the allowed list echoed.
 * Centrifugo's HTTP API answers **HTTP 200 even for logical failures** — the
-  sidecar maps those to a real HTTP error + `error` field for you; still
-  check both levels.
+  sidecar maps those to a real HTTP error + `error: "centrifugo_api_error"`
+  (+ Centrifugo's own code/message) for you; still check both levels.
 
 Same pattern in Python:
 
 ```python
-issuer = os.environ["TOKEN_ISSUER_URL"]            # …/realtime/token
+issuer = os.environ["PROXY_URL"]            # …/realtime/token
 base   = issuer.rsplit("/realtime/token", 1)[0]
 
 bundle = requests.post(issuer, headers={"Authorization": auth}).json()["connection"]
@@ -207,11 +234,13 @@ The supported storyline for real applications:
 
 | Browser flow | Server flow |
 |---|---|
-| authorization code + PKCE → `POST /oauth/token` (app proxy) → Bearer token kept in memory | your `/realtime/connection` verifies Bearer via IdP JWKS + policy → relays it to the token-issuer sidecar → returns the minted bundle — the IdP token *is not* the WS token, it only proves who you are |
+| authorization code + PKCE → `POST /oauth/token` (app proxy) → Bearer token kept in memory | your `/realtime/connection` verifies Bearer via IdP JWKS + policy → relays it to the proxy sidecar → returns the minted bundle — the IdP token *is not* the WS token, it only proves who you are |
 
 (`POST /session/demo` in `server/app.js` exists only for offline lab demos —
-the IdP-only sidecar refuses it for WS/publish; the offline storyline is the
-mock IdP on :9001, used by `scripts/e2e-test.mjs` and `scripts/m2m-test.mjs`.)
+in sidecar mode the app itself refuses session users at negotiate/publish
+with `403 session_not_valid_with_proxy` / `403 session_cannot_publish`
+("sign in at the IdP instead"); the offline storyline is the mock IdP on
+:9001, used by `scripts/e2e-test.mjs` and `scripts/m2m-test.mjs`.)
 
 ---
 
@@ -221,8 +250,10 @@ mock IdP on :9001, used by `scripts/e2e-test.mjs` and `scripts/m2m-test.mjs`.)
 |---|---|---|
 | `connect` → `permission denied` (3501 on malformed frame) | protocol misuse | Use `centrifuge-js` |
 | Negotiate works, connect → `permission denied` | mint/verify pairing broken on the Centrifugo side | deployment-level, not app-level: the issuing and verifying secrets must be one and the same (see the pairing table in [`CENTRIFUGO.md`](CENTRIFUGO.md)) — redeploy with a consistent `.env`; never bake anything into the SPA |
+| Browser call → `403 origin_not_allowed` | the SPA is served from an origin outside the sidecar's `ALLOWED_ORIGINS` (server-to-server callers send no Origin and always pass) | add the SPA's origin to `ALLOWED_ORIGINS` (glob: one `*` = one subdomain label) |
 | Publish → HTTP error or nothing sent | `error` relayed from Centrifugo | check the channel/namespace names (Centrifugo-side config); the X-API-Key pairing lives entirely on the Centrifugo side — see [`CENTRIFUGO.md`](CENTRIFUGO.md) |
 | Publish → `403 insufficient_scope` | the IdP token lacks the publisher scope | grant `api://ws-server/app:publisher` to the calling OAuth client at the IdP and re-login (negotiate keeps working without it — scope is a publish-only fence) |
+| Publish → `503 misconfigured` ("X-API-Key no longer lives in this app") | `PROXY_URL` unset on the app server | point `PROXY_URL` at the sidecar's `…/realtime/token` endpoint |
 | `401` on negotiate after login | IdP token expired or policy changed | re-login at the IdP and re-run negotiate |
 | Token expired at refresh | `getToken` not re-entrant / caching null | ensure `negotiate()` validates user auth afresh |
 

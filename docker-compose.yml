@@ -94,7 +94,7 @@ services:
       REQUIRED_CLAIMS: ${REQUIRED_CLAIMS:-sub,exp,iat,nbf,iss,aud}
       # empty = token validation only (authN); publish scope gates publishing
       REQUIRED_SCOPES: ${REQUIRED_SCOPES:-}
-      # Centrifugo hops ALL go through the token-issuer sidecar (mint + Server-
+      # Centrifugo hops ALL go through the proxy sidecar (mint + Server-
       # API proxy): the app sends Bearer tokens only, never the X-API-Key.
       # WS endpoint the SPA receives from POST /realtime/connection — swap for
       # a gateway/proxy URL without client releases. Channel is App-managed.
@@ -106,17 +106,17 @@ services:
       CONNECTION_TOKEN_MODE: ${CONNECTION_TOKEN_MODE:-hmac}
       # Minting moved to the Centrifugo side: the app REQUIRES the issuer
       # instead of holding the HMAC secret. Full endpoint of POST /realtime/token.
-      TOKEN_ISSUER_URL: ${TOKEN_ISSUER_URL:-http://token-issuer:4000/realtime/token}
+      PROXY_URL: ${PROXY_URL:-http://proxy:4000/realtime/token}
       CONNECTION_TTL: ${CONNECTION_TTL:-300}
       SESSION_SECRET: ${SESSION_SECRET:-demo-session-secret-change-me}
       SESSION_TTL: ${SESSION_TTL:-28800}
     depends_on:
       - centrifugo
-      - token-issuer
+      - proxy
     restart: unless-stopped
 
   # ------------------------------------------------------------------
-  # TOKEN-ISSUER SIDECAR — the "wall" of the Centrifugo side. It is the
+  # PROXY SIDECAR — the "wall" of the Centrifugo side. It is the
   # single holder of both Centrifugo secrets and the only OAuth-aware
   # door in front of them:
   #   • POST /realtime/token  — validates the publisher's OAuth token (JWKS +
@@ -128,11 +128,11 @@ services:
   #     the publish scope; read-only methods pass the base policy.
   # No ports published: reachable inside the compose network only.
   # ------------------------------------------------------------------
-  token-issuer:
+  proxy:
     build:
       context: .
-      dockerfile: token-issuer/Dockerfile
-    container_name: token-issuer
+      dockerfile: proxy/Dockerfile
+    container_name: proxy
     environment:
       PORT: 4000
       # OAuth validation of the publisher (same IdP as the App server). Base
