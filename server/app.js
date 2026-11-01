@@ -43,13 +43,12 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const JWKS_URL =
   process.env.JWKS_URL || 'https://auth.adolfrey.com/api/.well-known/jwks.json';
 
-// Expected issuer/audience of access tokens. These must match BOTH:
-//   - centrifugo/config.json  (client.token.issuer / client.token.audience)
-//   - the values the IdP stamps into tokens (IdP issuer / audience mappers)
-// AUTH_AUDIENCE accepts a comma-separated list when the IdP stamps different
-// audiences per client (e.g. user tokens aud=ws-server + M2M tokens aud=speedtest).
+// Expected issuer of access tokens — verified against the IdP's JWKS.
+// AUTH_AUDIENCE is OPTIONAL: empty (default) = issuer-only trust; the `aud`
+// claim is NOT enforced as long as the issuer matches. Set a comma-list here
+// to pin specific audiences (defense-in-depth) when you want it.
 const ISSUER = process.env.AUTH_ISSUER || 'https://auth.adolfrey.com/api';
-const AUDIENCE = String(process.env.AUTH_AUDIENCE || 'ws-server')
+const AUDIENCE = String(process.env.AUTH_AUDIENCE || '')
   .split(/[\s,]+/)
   .filter(Boolean);
 
@@ -239,12 +238,11 @@ async function requireAccessToken(req, res, next) {
   }
 
   try {
-    // Signature (RS256 via JWKS), iss and aud are verified here.
-    const { payload, protectedHeader } = await jwtVerify(token, remoteJWKS, {
-      issuer: ISSUER,
-      audience: AUDIENCE,
-      algorithms: ['RS256'],
-    });
+    // Signature (RS256 via JWKS) and issuer are verified here; audience only
+    // when AUTH_AUDIENCE is set (empty = issuer-only trust).
+    const jwtOptions = { issuer: ISSUER, algorithms: ['RS256'] };
+    if (AUDIENCE.length > 0) jwtOptions.audience = AUDIENCE;
+    const { payload, protectedHeader } = await jwtVerify(token, remoteJWKS, jwtOptions);
 
     const problems = validateRequiredClaims(payload);
     if (problems.length > 0) {
@@ -254,7 +252,7 @@ async function requireAccessToken(req, res, next) {
         problems,
         expected: {
           issuer: ISSUER,
-          audience: AUDIENCE,
+          audience: AUDIENCE.length ? AUDIENCE : '(any — not enforced)',
           required_claims: REQUIRED_CLAIMS,
           required_scopes: REQUIRED_SCOPES,
         },
@@ -707,7 +705,7 @@ app.get('/healthz', (_req, res) => {
     ok: true,
     jwks_url: JWKS_URL,
     expected_issuer: ISSUER,
-    expected_audience: AUDIENCE,
+    expected_audience: AUDIENCE.length ? AUDIENCE : null,
     required_claims: REQUIRED_CLAIMS,
     required_scopes: REQUIRED_SCOPES,
     token_issuer_url: TOKEN_ISSUER_URL || null,
@@ -741,7 +739,7 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
   console.log(`[app]      listening on http://localhost:${PORT}`);
   console.log(`[app]      JWKS:   ${JWKS_URL}`);
-  console.log(`[app]      issuer: ${ISSUER}  audience: ${AUDIENCE}`);
+  console.log(`[app]      issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
   console.log(`[app]      required claims: ${REQUIRED_CLAIMS.join(', ')}`);
   console.log(`[app]      required scopes: ${REQUIRED_SCOPES.join(' ')}`);
   console.log(`[app]      publish via:     ${TOKEN_ISSUER_URL ? `${publishEndpoint()} (sidecar holds the X-API-Key)` : '(unset — publishing disabled)'}`);

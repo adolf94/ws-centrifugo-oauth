@@ -160,6 +160,13 @@ Interface:
 
 Semantics to rely on:
 
+* **origin fence**: browser-style `Origin` headers must match `ALLOWED_ORIGINS`
+  (Centrifugo-style glob, default `https://*.adolfrey.com` — one `*` = one
+  subdomain label); server-to-server callers send no Origin header and pass
+  unconditionally. Blocked browsers get `403 origin_not_allowed`.
+
+Semantics to rely on:
+
 * a caller can only mint **for themselves** — the minted token's `sub` is
   taken from the token just verified, never from a request body;
 * the sidecar's token policy is the same allow-list as the App server's —

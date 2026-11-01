@@ -24,12 +24,21 @@ services:
     image: '${IMAGE:? IMAGE must be set — gh_webhooks does this; manual boot: export IMAGE=… }'
     command: ["node", "/app/token-issuer/server.js"]
     environment:
+      # explicit: the unified image carries no ITS-own default anymore and the
+      # healthcheck/known port is 4000 (do not let defaults drift):
+      PORT: "4000"
       # OAuth validation of ANY publisher (your app's users via their app,
       # M2M identities of your app, etc.):
       JWKS_URL: ${AUTH_JWKS_URL}
       AUTH_ISSUER: ${AUTH_ISSUER}
-      AUTH_AUDIENCE: ${AUTH_AUDIENCE}
+      # OAuth validation (same IdP as the App API). The audience is intentionally
+      # left empty: issuer-only trust — the aud claim is NOT enforced; set a
+      # comma-list in .env for defense-in-depth pinning.
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-}
       ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS}
+      # Origin fence (browser Origin header; Centrifugo-style glob — one '*' is
+      # one subdomain label). Server-to-server callers pass without Origin.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://*.adolfrey.com}
       REQUIRED_CLAIMS: ${REQUIRED_CLAIMS:-sub,exp,iat,nbf,iss,aud}
       # ── 1 of the 2 containers that hold Centrifugo secrets ──
       CENTRIFUGO_TOKEN_HMAC: ${CENTRIFUGO_TOKEN_HMAC_SECRET}

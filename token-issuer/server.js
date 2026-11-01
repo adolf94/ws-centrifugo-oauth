@@ -45,10 +45,12 @@ const PORT = parseInt(process.env.PORT || '4000', 10);
 // valid IdP token — user tokens via the app's proxy, or M2M tokens directly).
 const JWKS_URL =
   process.env.JWKS_URL || 'https://auth.adolfrey.com/api/.well-known/jwks.json';
-// AUTH_AUDIENCE accepts a comma-separated list when the IdP stamps different
-// audiences per client (user tokens vs M2M tokens).
+// Expected issuer of access tokens — verified against the IdP's JWKS.
+// AUTH_AUDIENCE is OPTIONAL: empty (default) = issuer-only trust; the `aud`
+// claim is NOT enforced as long as the issuer matches. Set a comma-list here
+// to pin specific audiences (defense-in-depth) when you want it.
 const ISSUER = process.env.AUTH_ISSUER || 'https://auth.adolfrey.com/api';
-const AUDIENCE = String(process.env.AUTH_AUDIENCE || 'ws-server')
+const AUDIENCE = String(process.env.AUTH_AUDIENCE || '')
   .split(/[\s,]+/)
   .filter(Boolean);
 
@@ -78,10 +80,26 @@ const CHANNEL = process.env.DEMO_CHANNEL || 'chat';
 // Publish hop: Centrifugo v6 OSS protects its HTTP Server API with X-API-Key
 // ONLY (Bearer/JWKS server-API auth exists in Centrifugo PRO, not OSS). This
 // sidecar is the single holder of that key, in front of the /api door.
-const CENTRIFUGO_API_URL = process.env.CENTRIFUGO_API_URL || 'http://centrifugo:8000/api';
-const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY || '';
+const CENTRIFUGO_API_URL = process.env.CENTRIFUGO_API_URL || 'http://centrifugo:8000/api';const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY || '';
 const PUBLISH_REQUIRED_SCOPE =
   process.env.PUBLISH_REQUIRED_SCOPE || 'api://ws-server/app:publisher';
+
+// Origin fence for browser-originated callers (Centrifugo-style glob, e.g.
+// https://*.adolfrey.com — one '*' matches a single subdomain label).
+// Server-to-server callers send NO Origin header and always pass. Empty env
+// value falls back to the *.adolfrey.com default.
+const DEFAULT_ALLOWED_ORIGINS = 'https://*.adolfrey.com';
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS)
+  .split(/[\s,]+/)
+  .filter(Boolean);
+const ORIGIN_MATCHERS = ALLOWED_ORIGINS.map((pattern) => new RegExp(
+  '^' + pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^.]*') + '$',
+  'i'
+));
+function originAllowed(origin) {
+  if (!origin) return true;            // server-to-server (no Origin header)
+  return ORIGIN_MATCHERS.some((re) => re.test(origin));
+}
 
 // Generic Server-API proxy policy: which methods may be relayed at all, and
 // extra scope for the state-changing ones (read-only methods only need to
@@ -164,11 +182,11 @@ async function verifyPublisher(req) {
     };
   }
   try {
-    const { payload, protectedHeader } = await jwtVerify(token, remoteJWKS, {
-      issuer: ISSUER,
-      audience: AUDIENCE,
-      algorithms: ['RS256'],
-    });
+    // Signature (RS256 via JWKS) and issuer are verified here; audience only
+    // when AUTH_AUDIENCE is set (empty = issuer-only trust).
+    const jwtOptions = { issuer: ISSUER, algorithms: ['RS256'] };
+    if (AUDIENCE.length > 0) jwtOptions.audience = AUDIENCE;
+    const { payload, protectedHeader } = await jwtVerify(token, remoteJWKS, jwtOptions);
     const problems = validateRequiredClaims(payload);
     if (problems.length > 0) {
       return {
@@ -179,7 +197,7 @@ async function verifyPublisher(req) {
           problems,
           expected: {
             issuer: ISSUER,
-            audience: AUDIENCE,
+            audience: AUDIENCE.length ? AUDIENCE : '(any — not enforced)',
             required_claims: requiredClaims(),
             required_scopes: REQUIRED_SCOPES,
           },
@@ -228,6 +246,21 @@ function mintConnectionJwt({ subject, scopes, maxExp }) {
 // ---------------------------------------------------------------------------
 const app = express();
 app.use(express.json({ limit: '16kb' }));
+
+// Origin fence: applies to every route except the health endpoint (GET).
+// Browsers always send Origin on CORS-style calls; servers don't — so this
+// only ever bites a browser pointing at the internal door, which is exactly
+// what the fence is for.
+app.use((req, res, next) => {
+  if (req.path === '/healthz') return next();
+  const origin = req.headers.origin;
+  if (originAllowed(origin)) return next();
+  console.warn(`[issuer]   origin rejected: ${origin} ${req.method} ${req.path}`);
+  return res.status(403).json({
+    error: 'origin_not_allowed',
+    detail: `origin "${origin}" is not in ALLOWED_ORIGINS (${ALLOWED_ORIGINS.join(', ')})`,
+  });
+});
 
 /**
  * POST /realtime/token — mint a Centrifugo connection JWT.
@@ -348,10 +381,18 @@ app.post('/publish', async (req, res) => {
       ? req.body.message.trim()
       : `hello from ${from} @ ${new Date().toISOString()}`;
 
-  const result = await centrifugoFetch('publish', {
-    channel: CHANNEL,
-    data: { text, from, sent_at: new Date().toISOString() },
-  });
+  let result;
+  try {
+    result = await centrifugoFetch('publish', {
+      channel: CHANNEL,
+      data: { text, from, sent_at: new Date().toISOString() },
+    });
+  } catch (err) {
+    return res.status(502).json({
+      error: 'centrifugo_unreachable',
+      detail: `relay to ${CENTRIFUGO_API_URL}/publish failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
 
   respondFromCentrifugo(res, 'publish', result, {
     published: { text, from },
@@ -399,7 +440,15 @@ app.post('/centrifugo/:method', async (req, res) => {
   }
   if (!requireApiKey(res)) return;
 
-  const result = await centrifugoFetch(method, req.body ?? {});
+  let result;
+  try {
+    result = await centrifugoFetch(method, req.body ?? {});
+  } catch (err) {
+    return res.status(502).json({
+      error: 'centrifugo_unreachable',
+      detail: `relay to ${CENTRIFUGO_API_URL}/${method} failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
   respondFromCentrifugo(res, method, result, {
     claims: {
       sub: payload.sub ?? null,
@@ -414,13 +463,14 @@ app.get('/healthz', (_req, res) => {
     ok: Boolean(CENTRIFUGO_TOKEN_HMAC) && Boolean(CENTRIFUGO_API_KEY),
     jwks_url: JWKS_URL,
     expected_issuer: ISSUER,
-    expected_audience: AUDIENCE,
+    expected_audience: AUDIENCE.length ? AUDIENCE : null,
     required_claims: requiredClaims(),
     required_scopes: REQUIRED_SCOPES,
     publish_required_scope: PUBLISH_REQUIRED_SCOPE,
     connection_ttl: CONNECTION_TTL,
     channel: CHANNEL,
     allowed_client_ids: ALLOWED_CLIENT_IDS,
+    allowed_origins: ALLOWED_ORIGINS,
     centrifugo_api_url: CENTRIFUGO_API_URL,
     allowed_api_methods: ALLOWED_API_METHODS,
     has_mint_secret: Boolean(CENTRIFUGO_TOKEN_HMAC),
@@ -431,7 +481,8 @@ app.get('/healthz', (_req, res) => {
 app.listen(PORT, () => {
   console.log(`[issuer]   listening on http://localhost:${PORT} (internal only)`);
   console.log(`[issuer]   JWKS:   ${JWKS_URL}`);
-  console.log(`[issuer]   issuer: ${ISSUER}  audience: ${AUDIENCE}`);
+  console.log(`[issuer]   issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
+  console.log(`[issuer]   allowed origins: ${ALLOWED_ORIGINS.join(', ')} (server-to-server callers pass without Origin)`);
   console.log(`[issuer]   required scopes: ${REQUIRED_SCOPES.join(' ')}; publish scope: ${PUBLISH_REQUIRED_SCOPE}`);
   console.log(`[issuer]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"`);
   console.log(`[issuer]   Server-API proxy → ${CENTRIFUGO_API_URL} (X-API-Key held here only)`);

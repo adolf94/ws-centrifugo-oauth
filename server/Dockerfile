@@ -24,8 +24,7 @@ COPY server /app/server
 COPY client /app/client
 COPY token-issuer /app/token-issuer
 
-ENV PORT=3000 \
-    JWKS_URL=https://auth.adolfrey.com/api/.well-known/jwks.json \
+ENV JWKS_URL=https://auth.adolfrey.com/api/.well-known/jwks.json \
     AUTH_ISSUER=https://auth.adolfrey.com/api \
     AUTH_AUDIENCE=ws-server \
     AUTH_AUTHORIZE_URL=https://auth.adolfrey.com/api/authorize \

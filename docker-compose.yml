@@ -80,7 +80,7 @@ services:
       # IdP endpoints + client metadata (single source of truth: .env).
       JWKS_URL: ${AUTH_JWKS_URL:-https://auth.adolfrey.com/api/.well-known/jwks.json}
       AUTH_ISSUER: ${AUTH_ISSUER:-https://auth.adolfrey.com/api}
-      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-ws-server}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-}
       AUTH_TOKEN_URL: ${AUTH_TOKEN_URL:-https://auth.adolfrey.com/api/token}
       AUTH_CLIENT_ID: ${AUTH_CLIENT_ID:-ws-server}
       AUTH_CLIENT_SECRET: ${AUTH_CLIENT_SECRET:-}
@@ -140,10 +140,13 @@ services:
       # mint AND the relayed Server-API calls.
       JWKS_URL: ${AUTH_JWKS_URL:-https://auth.adolfrey.com/api/.well-known/jwks.json}
       AUTH_ISSUER: ${AUTH_ISSUER:-https://auth.adolfrey.com/api}
-      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-ws-server}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-}
       REQUIRED_CLAIMS: ${REQUIRED_CLAIMS:-sub,exp,iat,nbf,iss,aud}
       REQUIRED_SCOPES: ${REQUIRED_SCOPES:-}
       ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS:-}
+      # Origin fence (browser Origin header; Centrifugo-style glob — one '*' is
+      # one subdomain label). Server-to-server callers pass without Origin.
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://*.adolfrey.com}
       # The minting secret + API key — only this sidecar and centrifugo
       # receive any Centrifugo secret. The app server: none.
       CENTRIFUGO_TOKEN_HMAC: ${CENTRIFUGO_TOKEN_HMAC_SECRET:-}

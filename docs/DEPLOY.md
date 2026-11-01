@@ -43,8 +43,9 @@ Then set, per `docs/CENTRIFUGO.md`'s pairing table:
 
 | Key | Value |
 |---|---|
-| `AUTH_*` endpoints | your **production** IdP URLs |
-| `AUTH_AUDIENCE` | comma-list of audiences the IdP stamps (your publishers' user + M2M tokens) |
+| `AUTH_ISSUER` / `AUTH_JWKS_URL` | your **production** IdP URLs — these anchor trust (signature + issuer; the `aud` claim is NOT enforced unless `AUTH_AUDIENCE` is set) |
+| `ALLOWED_ORIGINS` | sidecar origin fence, Centrifugo-style glob (default `https://*.adolfrey.com`; one `*` = one subdomain label; server-to-server callers pass without an Origin header) |
+| `AUTH_AUDIENCE` (optional) | leave empty for issuer-only trust; set a comma-list only if you want audiences pinned again |
 | `ALLOWED_CLIENT_IDS` | the OAuth client-ids that may knock at the wall (your publishers' clients) |
 | `CENTRIFUGO_PUBLIC_WS_URL` | `wss://realtime。<your-domain>/connection/websocket` |
 | `CENTRIFUGO_LOG_LEVEL` | `info` (debug only while wiring) |
@@ -61,8 +62,8 @@ Do **not** put real secrets in `centrifugo/config.json` — the API key is env-i
    at **their own app**, which then calls the wall.
 2. Grant the publisher scope `api://ws-server/app:publisher` to the clients
    that may publish.
-3. Audience mapping: tokens must pass `AUTH_AUDIENCE` (the comma-list covers
-   the user + M2M audiences of your publishers).
+3. Audience mapping is **optional** — trust anchors on the issuer; set
+   `AUTH_AUDIENCE` only if you want specific audiences pinned.
 
 ## 3 · `centrifugo/config.json` — production edits (on the server)
 
@@ -142,6 +143,7 @@ services:
       AUTH_ISSUER: ${AUTH_ISSUER}
       AUTH_AUDIENCE: ${AUTH_AUDIENCE}
       ALLOWED_CLIENT_IDS: ${ALLOWED_CLIENT_IDS}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://*.adolfrey.com}
       REQUIRED_CLAIMS: ${REQUIRED_CLAIMS}
       # this is 1 of the 2 containers that hold Centrifugo secrets:
       CENTRIFUGO_TOKEN_HMAC: ${CENTRIFUGO_TOKEN_HMAC_SECRET}
@@ -266,7 +268,7 @@ Tag/whitelist alignment rules (pick one scheme and stay aligned):
 ## 8 · Pre-flight checklist
 
 - [ ] `.env` created (wall-only values); 2 generated secrets set; no value committed to git
-- [ ] Publisher clients registered at the IdP; publisher scope granted; `AUTH_AUDIENCE` list matches
+- [ ] Publisher clients registered at the IdP; publisher scope granted (audience pin optional — empty by default)
 - [ ] `centrifugo.prod.json`: origins tightened, `admin.enabled=false`
 - [ ] Reverse proxy: WS upgrade headers + ≥1h read timeout on `realtime`
 - [ ] `CENTRIFUGO_PUBLIC_WS_URL` uses `wss://` to the proxy hostname
