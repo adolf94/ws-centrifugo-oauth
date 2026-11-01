@@ -248,6 +248,21 @@ curl -fsS "http://127.0.0.1:8000/api/channels" -H "X-API-Key: $(grep -m1 '^CENTR
 | Stop everything | `docker compose down` (no persistent volumes to worry about) |
 | Offline lab / mock IdP | only in the repo dev compose (`docker compose up -d auth-server`) — not in this prod dir |
 
+### Pull-access-denied playbook (webhook deploy fails at `compose pull`)
+
+| Check | Command expected | Meaning |
+|---|---|---|
+| Does the tag exist at all? | `docker manifest inspect ghcr.io/<owner>/<repo>:<sha>` (any machine with login) | manifest not found ⇒ the workflow never pushed that ref — check the Actions run's "pushed:" lines |
+| Does the *server* see it? | `sudo docker manifest inspect …` ON the server | "denied" ⇒ server not logged in to that registry (or package private ⇒ see below) |
+| What did the webhook actually try? | `docker logs gh_webhooks` — the `IMAGE=<…>` line | mismatched registry path (`adolf94/…` vs `ghcr.io/…`), or a tag never pushed (short-sha style) |
+| Registry login on the server | `echo $PAT \| docker login ghcr.io -u <user> --password-stdin` (PAT with `read:packages`) · `docker login docker.io -u <user>` | one-time per host |
+| Package visibility | repo → Packages → ws-* → Package settings → visibility **public** (or keep private + login) | private GHCR images reject anonymous pulls |
+
+Tag/whitelist alignment rules (pick one scheme and stay aligned):
+
+* canonical: whitelist `"image": "ghcr.io/<owner>/<repo>"` + post `tag=<full-sha>` (deploy.yml does exactly this);
+* if your whitelist uses the short style, alternative tags `sha-<short7>` and `latest` are now also pushed — but the whitelist/registry-path must still match exactly (`ghcr.io/…` ≠ `docker.io/…` ≠ bare `adolf94/…`).
+
 ## 8 · Pre-flight checklist
 
 - [ ] `.env` created (wall-only values); 2 generated secrets set; no value committed to git
