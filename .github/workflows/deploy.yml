@@ -1,17 +1,8 @@
-# APP_DEPLOY via homelab gh_webhooks.
-# Builds the unified app+token-issuer image, pushes it to GHCR, then POSTs an
-# HMAC-signed payload to https://apis.adolfrey.com/gh_webhooks/d — the webhook
-# runs `IMAGE=<sha> docker compose pull && docker compose up -d --no-deps` in
-# /srv/deploy/<name>/ on the homelab host.
-# Required repo secrets:
-#   CF_ACCESS_CLIENT_ID / CF_ACCESS_CLIENT_SECRET  — Cloudflare Access service token
-#   HOMELAB_WEBHOOK_SECRET                         — WEBHOOK_SECRET shared with gh_webhooks
+
 
 name: build & deploy
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -44,7 +35,8 @@ jobs:
 
       - uses: docker/build-push-action@v6
         with:
-          context: token-issuer/.
+          context: .
+          file: token-issuer/Dockerfile
           push: true
           tags: ${{ steps.img.outputs.image }}
           cache-from: type=gha
