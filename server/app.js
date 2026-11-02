@@ -585,7 +585,7 @@ app.post('/publish', requireUserAuth, async (req, res, next) => {
         'Content-Type': 'application/json',
         Authorization: req.headers.authorization, // sidecar re-verifies via JWKS
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ payload: message }),
     });
 
     const body = await proxyRes.json().catch(() => null);
@@ -672,7 +672,7 @@ app.post('/service/publish', async (req, res, next) => {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`, // sidecar verifies + scope-checks
       },
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ payload: message }),
     });
     const body = await proxyRes.json().catch(() => null);
     if (!proxyRes.ok) {

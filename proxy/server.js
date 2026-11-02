@@ -85,6 +85,22 @@ const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY || '';
 const PUBLISH_REQUIRED_SCOPE =
   process.env.PUBLISH_REQUIRED_SCOPE || 'api://ws-server/app:publisher';
 
+// Publish sugar content field: 'payload' — a non-empty string is wrapped into
+// the {text, from, sent_at} envelope; a non-empty plain object becomes the
+// publish data verbatim (identity-stamped). Anything else falls back to the
+// default hello envelope.
+function pickPublishContent(body) {
+  const value = body?.payload;
+  if (typeof value === 'string' && value.trim() !== '') {
+    return { kind: 'text', text: value.trim() };
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value) &&
+      Object.keys(value).length > 0) {
+    return { kind: 'object', data: value };
+  }
+  return null;
+}
+
 // Mint shaping (server-side subscriptions + mint-on-behalf): who may choose
 // the `sub`/`channels`/`subs` of a mint. Default = the same trust marker as
 // publishing, i.e. the app-server / M2M service identities. Public SPA
@@ -639,9 +655,12 @@ function requireApiKey(res) {
 }
 
 /**
- * POST /publish — sugar over the proxy: builds the standard publish envelope
+ * POST /publish — sugar over the relay: builds the standard publish envelope
  * from the verified publisher's identity. Scope enforced HERE, in front of
  * the X-API-Key door (the caller — the app server — holds no API key).
+ * The content field is 'payload': a non-empty string becomes the
+ * {text, from, sent_at} envelope; a non-empty object payload becomes the
+ * publish data verbatim, identity-stamped.
  */
 app.post('/publish', async (req, res) => {
   const verified = await verifyPublisher(req);
@@ -666,16 +685,23 @@ app.post('/publish', async (req, res) => {
     typeof req.body?.channel === 'string' && req.body.channel.trim() !== ''
       ? transformGroupChannel(req.body.channel.trim(), clientId)
       : CHANNEL;
-  const text =
-    typeof req.body?.message === 'string' && req.body.message.trim() !== ''
-      ? req.body.message.trim()
-      : `hello from ${from} @ ${new Date().toISOString()}`;
+  const content = pickPublishContent(req.body);
+  const data = content
+    ? (content.kind === 'text'
+        ? { text: content.text, from, sent_at: new Date().toISOString() }
+        : { ...content.data, from, sent_at: new Date().toISOString() })
+    : {
+        text: `hello from ${from} @ ${new Date().toISOString()}`,
+        from,
+        sent_at: new Date().toISOString(),
+      };
+  const publishedText = typeof data.text === 'string' ? data.text : '(object payload)';
 
   let result;
   try {
     result = await centrifugoFetch('publish', {
       channel: targetChannel,
-      data: { text, from, sent_at: new Date().toISOString() },
+      data,
     });
   } catch (err) {
     return res.status(503).json({
@@ -685,7 +711,7 @@ app.post('/publish', async (req, res) => {
   }
 
   respondFromCentrifugo(res, 'publish', result, {
-    published: { text, from, channel: targetChannel },
+    published: { text: publishedText, from, channel: targetChannel },
     claims: {
       sub: payload.sub ?? null,
       service_subject: payload.client_id ?? null,
