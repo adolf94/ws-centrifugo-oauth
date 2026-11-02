@@ -518,7 +518,46 @@ app.post('/realtime/token', async (req, res) => {
   });
 });
 
-/** Shared relay into the Centrifugo HTTP Server API — the only X-API-Key use in the stack. */
+/**
+ * Effective channel names a relayed Server-API call ended up targeting AFTER
+ * the group client_id rewrite (`transformChannelsInRequestBody`). Echoed back
+ * in the proxy response so callers see the exact channel strings Centrifugo
+ * was asked about — inside the `group:*` namespace these are never the names
+ * the caller typed. Trailed through error replies too (extras are spread into
+ * the failure branch), which makes e.g. a `102 unknown channel` 404
+ * self-diagnosing.
+ */
+function effectiveChannels(method, body) {
+  if (!body || typeof body !== 'object') return undefined;
+  switch (method) {
+    case 'publish':
+    case 'subscribe':
+    case 'unsubscribe':
+    case 'presence':
+    case 'presence_stats':
+    case 'history':
+    case 'history_remove':
+      return typeof body.channel === 'string' ? [body.channel] : undefined;
+    case 'broadcast':
+      return Array.isArray(body.channels) ? body.channels : undefined;
+    case 'batch': {
+      const out = [];
+      for (const cmd of Array.isArray(body.commands) ? body.commands : []) {
+        if (!cmd || typeof cmd !== 'object') continue;
+        const nestedMethod = Object.keys(cmd)[0];
+        if (!nestedMethod) continue;
+        const nested = effectiveChannels(nestedMethod, cmd[nestedMethod]);
+        if (nested) out.push(...nested);
+      }
+      return out.length ? out : undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Shared relay into the Centrifugo HTTP Server API — the only X-API-Key use in the stack. */
 async function centrifugoFetch(method, bodyObject) {
   const apiRes = await fetch(`${CENTRIFUGO_API_URL}/${method}`, {
     method: 'POST',
@@ -535,7 +574,30 @@ async function centrifugoFetch(method, bodyObject) {
 /**
  * Map Centrifugo's HTTP-200-even-on-logical-failure behavior to a response:
  * BOTH levels are checked (HTTP status, then the JSON `error` field).
+ *
+ * Logical failures are mapped to 4xx by the Centrifugo error code table below
+ * (codes per https://centrifugal.dev/docs/server/server_api): the caller's
+ * request is what Centrifugo rejected, so the caller owns the error — and a
+ * 4xx passes through CDN fronts (Cloudflare) verbatim, where a 502 gets
+ * rewritten/branded and the JSON `detail`/`code` payload is lost.
  */
+const CENTRIFUGO_ERROR_STATUS = {
+  100: 202, // Centrifugo internal error — accepted-with-failure (see below)
+  102: 404, // unknown channel (undefined namespace, or no live subscribers when history is off)
+  104: 404, // not found
+  107: 400, // bad request (malformed arguments)
+  108: 202, // Centrifugo not available — accepted-with-failure (see below)
+  111: 429, // too many requests (rate limited upstream)
+  112: 400, // unrecoverable position (stream recovery impossible)
+  113: 409, // conflict (stream position/recovery race)
+};
+// 100/108 deliberately map to 202 Accepted instead of 5xx: when Centrifugo
+// reports "it couldn't complete this", the proxy still accepted and relayed
+// the request, so the caller owns both states — every failure detail travels
+// in the JSON body ({"error":"centrifugo_api_error","code":...}) with status
+// codes that CDN fronts (Cloudflare) relay verbatim instead of rebranding.
+// Callers MUST therefore treat a 202 as "check centrifugo_response".
+
 function respondFromCentrifugo(res, method, { apiRes, body }, extras = {}) {
   if (apiRes.status !== 200) {
     return res.status(apiRes.status).json({
@@ -545,10 +607,16 @@ function respondFromCentrifugo(res, method, { apiRes, body }, extras = {}) {
     });
   }
   if (body && body.error) {
-    return res.status(502).json({
+    const centrifugoCode = body.error.code;
+    const status =
+      (centrifugoCode !== null && centrifugoCode !== undefined &&
+        Object.hasOwn(CENTRIFUGO_ERROR_STATUS, Number(centrifugoCode)))
+        ? CENTRIFUGO_ERROR_STATUS[Number(centrifugoCode)]
+        : 400; // unknown code → the caller-supplied request was rejected
+    return res.status(status).json({
       error: 'centrifugo_api_error',
       detail: body.error.message || JSON.stringify(body.error),
-      code: body.error.code,
+      code: centrifugoCode,
       ...extras,
     });
   }
@@ -610,7 +678,7 @@ app.post('/publish', async (req, res) => {
       data: { text, from, sent_at: new Date().toISOString() },
     });
   } catch (err) {
-    return res.status(502).json({
+    return res.status(503).json({
       error: 'centrifugo_unreachable',
       detail: `relay to ${CENTRIFUGO_API_URL}/publish failed: ${err instanceof Error ? err.message : String(err)}`,
     });
@@ -670,6 +738,7 @@ async function relayServerApiMethod(req, res) {
 
   const clientId = getClientId(payload);
   const transformedBody = transformChannelsInRequestBody(method, req.body ?? {}, clientId);
+  const effective = effectiveChannels(method, transformedBody);
 
   if (!requireApiKey(res)) return;
 
@@ -677,7 +746,7 @@ async function relayServerApiMethod(req, res) {
   try {
     result = await centrifugoFetch(method, transformedBody);
   } catch (err) {
-    return res.status(502).json({
+    return res.status(503).json({
       error: 'centrifugo_unreachable',
       detail: `relay to ${CENTRIFUGO_API_URL}/${method} failed: ${err instanceof Error ? err.message : String(err)}`,
     });
@@ -689,6 +758,7 @@ async function relayServerApiMethod(req, res) {
       service_subject: payload.client_id ?? null,
       granted_scopes: [...scopes],
     },
+    ...(effective ? { effective_channels: effective } : {}),
   });
 }
 
