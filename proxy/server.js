@@ -85,12 +85,14 @@ const CENTRIFUGO_API_KEY = process.env.CENTRIFUGO_API_KEY || '';
 const PUBLISH_REQUIRED_SCOPE =
   process.env.PUBLISH_REQUIRED_SCOPE || 'api://ws-server/app:publisher';
 
-// Publish sugar content field: 'payload' — a non-empty string is wrapped into
-// the {text, from, sent_at} envelope; a non-empty plain object becomes the
-// publish data verbatim (identity-stamped). Anything else falls back to the
-// default hello envelope.
+// Publish sugar content field: 'data' — matching Centrifugo's own Server-API
+// publish contract ({"channel":..., "data":...}), so the sugar and the
+// verbatim relay lane read the same field name. A non-empty string is
+// wrapped into the {text, from, sent_at} envelope; a non-empty plain object
+// becomes the publish data verbatim (identity-stamped). Anything else falls
+// back to the default hello envelope.
 function pickPublishContent(body) {
-  const value = body?.payload;
+  const value = body?.data;
   if (typeof value === 'string' && value.trim() !== '') {
     return { kind: 'text', text: value.trim() };
   }
@@ -658,9 +660,10 @@ function requireApiKey(res) {
  * POST /publish — sugar over the relay: builds the standard publish envelope
  * from the verified publisher's identity. Scope enforced HERE, in front of
  * the X-API-Key door (the caller — the app server — holds no API key).
- * The content field is 'payload': a non-empty string becomes the
- * {text, from, sent_at} envelope; a non-empty object payload becomes the
- * publish data verbatim, identity-stamped.
+ * The content field is 'data' — same name as Centrifugo's Server-API publish
+ * contract: a non-empty string becomes the {text, from, sent_at} envelope; a
+ * non-empty object payload becomes the publish data verbatim,
+ * identity-stamped.
  */
 app.post('/publish', async (req, res) => {
   const verified = await verifyPublisher(req);
