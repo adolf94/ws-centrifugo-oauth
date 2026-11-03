@@ -142,7 +142,7 @@ proxy:
     CENTRIFUGO_API_URL: http://centrifugo:8000/api
     CENTRIFUGO_API_KEY: ${CENTRIFUGO_HTTP_API_KEY:-…}
     PUBLISH_REQUIRED_SCOPE: ${PUBLISH_REQUIRED_SCOPE:-api://ws-server/app:publisher}
-    # mint shaping (sub/channels/subs on /realtime/token) — who may use it:
+    # mint shaping (channels/subs on /realtime/token) — who may use it:
     MINT_SHAPING_SCOPE: ${MINT_SHAPING_SCOPE:-<PUBLISH_REQUIRED_SCOPE>}
     MINT_MAX_SUBS: ${MINT_MAX_SUBS:-32}
     # group channel rewriting: group:<client_id>,<group> (prepend) or group:<group>,<client_id> (append)
@@ -157,21 +157,31 @@ proxy:
 
 Interface:
 
-* `POST /realtime/token` with `Authorization: Bearer <IdP access token>` →
-  `200 { connection: { url, token, channel, expires_in, subject }, minted_by,
-  claims }` on success; `401/400` on bad token, `403` on policy failure.
+* `POST /realtime/token` with `Authorization: Bearer <IdP access token>` and
+  JSON body `{ "user_token": "<the user's IdP access token> (REQUIRED)" }` →
+  `200 { connection: { url, token, channel, expires_in, connection_id
+  (uuidv7, = the JWT sub), user_id, client_id, user_channel }, minted_by,
+  claims }` on success; `401/400` on bad/missing tokens, `403` on policy
+  failure. The connection's user comes ONLY from the passthrough `user_token`
+  (its `sub` = user_id, its `client_id` = client_id — the latter must equal
+  the Authorization token's client_id or the mint replies
+  `400 client_id_validation_failed`); the minted JWT's `sub` is a fresh
+  UUIDv7 (the connection_id). The connection is AUTO-subscribed to the
+  reserved `user:<client_id>,<user_id>` channel.
   Optional body (ONLY for callers holding `MINT_SHAPING_SCOPE` — the
   app-server/M2M identities; user/SPA tokens get `403 insufficient_scope`):
-  * `sub` — mint on behalf of that user id (Centrifugo `sub` claim);
   * `channels: ["group:42", …]` — server-side subscriptions: Centrifugo
     subscribes the client to exactly these channels on connect;
   * `subs: { "group:42": { data?, info?, override? } }` — same, with
     per-channel options (welcome `data`, presence `info`, option overrides).
+    Both REJECT `user:*` entries (`user_namespace_reserved`) — that namespace
+    is mint-managed only.
     These claims are how **group membership is enforced**: pair them with a
     namespace whose `allow_subscribe_for_client` is OFF (see the `group`
-    namespace in `centrifugo/config.json` / `centrifugo.sample.json`) — then
-    the mint is the only door into those channels, and the client cannot
-    subscribe to anything the app did not choose.
+    and `user` namespaces in `centrifugo/config.json` /
+    `centrifugo.sample.json`) — then the mint is the only door into those
+    channels, and the client cannot subscribe to anything the app did not
+    choose.
 * `POST /publish` — sugar over the generic proxy: builds the `{channel, data}`
   publish envelope from the verified identity; returns `{ ok, via,
   centrifugo_method: "publish", published, claims, centrifugo_response }`.

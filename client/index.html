@@ -277,6 +277,7 @@
     conn = body.connection;
     $('authResult').innerHTML =
       `<span class="pill ok">200 OK</span><span class="pill">subject ${pretty(conn.subject)}</span>` +
+      (conn.user_id ? `<span class="pill">user ${pretty(conn.user_id)} · ${pretty(conn.user_channel ?? `user:${conn.client_id},${conn.user_id}`)}</span>` : '') +
       `<span class="pill">${pretty(body.claims.granted_scopes.join(' '))}</span>` +
       `<span class="pill">ttl ${conn.expires_in}s</span>`;
     log(`App API says: WebSocket ${conn.url} · channel ${conn.channel} · connection JWT valid ${conn.expires_in}s`, 'ok');

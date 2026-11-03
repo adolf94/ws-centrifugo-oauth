@@ -19,10 +19,19 @@
  *   Centrifugo ◄── connection JWT published token── HTTP /api/publish
  *   App server ◄──────── { connection | ok } ── relays the SPA response
  *
+ * Mint contract (SignalR-style mapping — see plan.md):
+ *   connection_id -> minted JWT `sub` = fresh UUIDv7 per mint
+ *   user_id       -> identity of the REQUIRED passthrough body `user_token`
+ *                    (its sub = user_id, its client_id = client_id; the
+ *                    client_id must equal the Authorization token's client_id)
+ *   user channel  -> AUTO-subscribed `user:<client_id>,<user_id>` at mint
+ *   groups        -> `group:` namespace via MINT_SHAPING_SCOPE shaping
+ * The `user` namespace is reserved: nobody shapes or subscribes it manually.
+ *
  * Why here: NO Centrifugo secret (minting HMAC or HTTP API key) ever leaves
- * this side. The app is a pure relay. `sub` always comes from the IdP token
+ * this side. The app is a pure relay. The user comes ONLY from the IdP token
  * verified cryptographically here — nobody can mint or publish as someone
- * they could not authenticate as.
+ * they could not authenticate as, and nobody picks the connection id.
  *
  * Network policy: no ports are published in docker-compose — reachable only
  * inside the compose network. A valid IdP token is always required.
@@ -34,6 +43,7 @@
 
 const crypto = require('node:crypto');
 const express = require('express');
+const { v7: uuidv7 } = require('uuid');
 const { createRemoteJWKSet, jwtVerify } = require('jose');
 
 // ---------------------------------------------------------------------------
@@ -103,12 +113,11 @@ function pickPublishContent(body) {
   return null;
 }
 
-// Mint shaping (server-side subscriptions + mint-on-behalf): who may choose
-// the `sub`/`channels`/`subs` of a mint. Default = the same trust marker as
-// publishing, i.e. the app-server / M2M service identities. Public SPA
-// clients (browser-direct mint lane) never hold it — they mint for
-// themselves with the default channel, so no browser can self-select
-// arbitrary groups.
+// Mint shaping (server-side subscriptions): who may choose the `channels`/
+// `subs` of a mint. Default = the same trust marker as publishing, i.e. the
+// app-server / M2M service identities. Public SPA clients (browser-direct
+// mint lane) never hold it — they mint for themselves with just the auto
+// user channel, so no browser can self-select arbitrary groups.
 const MINT_SHAPING_SCOPE =
   process.env.MINT_SHAPING_SCOPE || PUBLISH_REQUIRED_SCOPE;
 // How many server-side subscriptions one mint may attach.
@@ -122,6 +131,14 @@ const MINT_MAX_SUBS = parseInt(process.env.MINT_MAX_SUBS || '32', 10);
 const GROUP_CLIENT_ID_POSITION =
   (process.env.GROUP_CLIENT_ID_POSITION || 'prepend').toLowerCase();
 const GROUP_CLIENT_ID_DELIMITER = process.env.GROUP_CLIENT_ID_DELIMITER || ',';
+
+// The reserved `user` namespace — the SignalR "user_id as a group" mapping.
+// Its one channel member `user:<client_id>,<user_id>` is AUTO-subscribed at
+// mint time from the passthrough user_token's identity; the same position /
+// delimiter config as `group:*` applies. Manual subscriptions are refused at
+// every door: mint shaping (channels/subs), Server-API subscribe/unsubscribe
+// relays — and Centrifugo's own namespace has allow_subscribe_for_client off.
+const USER_NAMESPACE_PREFIX = 'user:';
 
 // Origin fence for browser-originated callers (Centrifugo-style glob, e.g.
 // https://*.adolfrey.com — one '*' matches a single subdomain label).
@@ -207,34 +224,25 @@ function validateRequiredClaims(payload) {
 }
 
 /**
- * Cryptographic gate for every endpoint: verifies the Bearer token against
- * the IdP's JWKS + policy. Returns {status, body} on rejection, or
- * {payload, scopes, header} for the verified publisher.
+ * Core gate: verifies ONE raw Bearer token against the IdP's JWKS + policy.
+ * Used for both the presenter (Authorization header) and the passthrough
+ * `user_token`. Returns {status, body} on rejection, or
+ * {payload, scopes, header} for the verified identity.
  */
-async function verifyPublisher(req) {
-  const auth = req.headers.authorization || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
-  if (!token) {
-    return {
-      status: 401,
-      body: {
-        error: 'unauthorized',
-        detail: 'Missing Authorization: Bearer <access token> header (the app must forward the verified IdP token)',
-      },
-    };
-  }
+async function verifyBearerToken(rawToken, source) {
   try {
     // Signature (RS256 via JWKS) and issuer are verified here; audience only
     // when AUTH_AUDIENCE is set (empty = issuer-only trust).
     const jwtOptions = { issuer: ISSUER, algorithms: ['RS256'] };
     if (AUDIENCE.length > 0) jwtOptions.audience = AUDIENCE;
-    const { payload, protectedHeader } = await jwtVerify(token, remoteJWKS, jwtOptions);
+    const { payload, protectedHeader } = await jwtVerify(rawToken, remoteJWKS, jwtOptions);
     const problems = validateRequiredClaims(payload);
     if (problems.length > 0) {
       return {
         status: 403,
         body: {
           error: 'insufficient_scope',
+          token: source,
           detail: `${protectedHeader.alg} token from sub="${payload.sub}" rejected`,
           problems,
           expected: {
@@ -249,12 +257,40 @@ async function verifyPublisher(req) {
     return { payload, scopes: scopeSet(payload), header: protectedHeader };
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
-    const expired = /expired|not yet valid/i.test(detail);
+    // jose flags temporal validity with codes: ERR_JWT_EXPIRED and
+    // ERR_JWT_NOT_YET_VALID (legacy messages don't always contain "expired").
+    const temporal =
+      err?.code === 'ERR_JWT_EXPIRED' || err?.code === 'ERR_JWT_NOT_YET_VALID' ||
+      /expired|not yet valid/i.test(detail);
     return {
-      status: expired ? 401 : 400,
-      body: { error: expired ? 'token_expired' : 'invalid_token', detail },
+      status: temporal ? 401 : 400,
+      body: { error: temporal ? 'token_expired' : 'invalid_token', token: source, detail },
     };
   }
+}
+
+function bearerTokenFrom(req) {
+  const auth = req.headers.authorization || '';
+  return auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+}
+
+/**
+ * Cryptographic gate for endpoints: verifies the Authorization Bearer token.
+ * (The mint additionally verifies the passthrough `user_token` body field via
+ * verifyBearerToken — same policy, authority-checked against this one.)
+ */
+async function verifyPublisher(req) {
+  const token = bearerTokenFrom(req);
+  if (!token) {
+    return {
+      status: 401,
+      body: {
+        error: 'unauthorized',
+        detail: 'Missing Authorization: Bearer <access token> header (the app must forward the verified IdP token)',
+      },
+    };
+  }
+  return verifyBearerToken(token, 'authorization');
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +318,11 @@ function validateChannels(value) {
     if (typeof c !== 'string' || !CHANNEL_NAME_RE.test(c)) {
       throw new Error(`invalid channel name: ${JSON.stringify(c)}`);
     }
+    if (isUserChannel(c)) {
+      throw new Error(
+        `channel namespace "user" is reserved (auto per-user group) — manual shaping of user:* is not allowed`
+      );
+    }
   }
   return value.length ? value : undefined;
 }
@@ -301,6 +342,11 @@ function validateSubs(value) {
     if (!CHANNEL_NAME_RE.test(ch)) {
       throw new Error(`invalid channel name: ${JSON.stringify(ch)}`);
     }
+    if (isUserChannel(ch)) {
+      throw new Error(
+        `channel namespace "user" is reserved (auto per-user group) — manual shaping of user:* is not allowed`
+      );
+    }
     if (opts === null || typeof opts !== 'object' || Array.isArray(opts)) {
       throw new Error(`subs[${JSON.stringify(ch)}] must be an options object`);
     }
@@ -311,6 +357,32 @@ function validateSubs(value) {
 function getClientId(payload) {
   if (!payload) return '';
   return payload.client_id ?? payload.azp ?? payload.sub ?? '';
+}
+
+function isUserChannel(channel) {
+  return typeof channel === 'string' && channel.startsWith(USER_NAMESPACE_PREFIX);
+}
+
+/**
+ * The auto per-user channel under the reserved `user:` namespace — the
+ * "user_id" group of the SignalR mapping: `user:<client_id>,<user_id>` by
+ * default, honoring the same position/delimiter knobs as group channels.
+ * Identity comes from the passthrough user_token, never from the caller.
+ */
+function userChannel(clientId, userId) {
+  if (GROUP_CLIENT_ID_POSITION === 'off' || GROUP_CLIENT_ID_POSITION === 'none' ||
+      GROUP_CLIENT_ID_POSITION === 'false' || !clientId) {
+    return `user:${userId}`;
+  }
+  if (GROUP_CLIENT_ID_POSITION === 'append') {
+    if (userId.endsWith(`${GROUP_CLIENT_ID_DELIMITER}${clientId}`)) return `user:${userId}`;
+    return `user:${userId}${GROUP_CLIENT_ID_DELIMITER}${clientId}`;
+  }
+  // prepend (default)
+  if (userId.startsWith(`${clientId}${GROUP_CLIENT_ID_DELIMITER}`)) {
+    return `user:${userId}`;
+  }
+  return `user:${clientId}${GROUP_CLIENT_ID_DELIMITER}${userId}`;
 }
 
 function transformGroupChannel(
@@ -376,15 +448,20 @@ function transformChannelsInRequestBody(method, body, clientId) {
   }
 }
 
-function mintConnectionJwt({ subject, scopes, maxExp, channels, subs }) {
+function mintConnectionJwt({ subject, scopes, maxExp, channels, subs, info }) {
   const now = Math.floor(Date.now() / 1000);
   const exp = Math.min(maxExp, now + CONNECTION_TTL);
   const header = { alg: 'HS256', typ: 'JWT' };
   const claims = {
-    sub: subject, // Centrifugo user id (Azure Web PubSub: userId)
+    sub: subject, // connection id (uuidv7) — the SignalR connection_id role
     exp, // short-lived; the SPA refreshes through the same relayed hop
     iat: now,
-    info: { scopes: [...scopes], minted_by: 'proxy' },
+    info: {
+      scopes: [...scopes],
+      minted_by: 'proxy',
+      // the verified passthrough token's identity (SignalR user_id mapping)
+      ...(info ?? {}),
+    },
   };
   // Server-side subscriptions: Centrifugo subscribes the client to these
   // channels automatically upon connect (connection-token `channels`/`subs`
@@ -436,14 +513,21 @@ app.use((req, res, next) => {
 /**
  * POST /realtime/token — mint a Centrifugo connection JWT.
  *
- * The subject of the minted token is exactly the subject of the verified
- * token: nobody can mint for someone else. One exception: callers holding
- * MINT_SHAPING_SCOPE (app-server/M2M identities) may mint on behalf of a
- * user (body.sub) and attach server-side subscriptions (body.channels /
- * body.subs) — Centrifugo then subscribes that client to exactly those
- * channels on connect, which is how group membership is enforced: pair it
- * with a namespace that has allow_subscribe_for_client OFF, and the mint
- * becomes the only door into the group channels.
+ * SignalR-style mapping (plan.md):
+ *   • body.user_token (REQUIRED) — the user's IdP passthrough access token.
+ *     Verified via the same JWKS/policy as the Authorization bearer; its
+ *     `sub` becomes the connection's user_id and its `client_id` the
+ *     connection's client_id. Authority check: the user_token's client_id
+ *     MUST equal the Authorization token's client_id — a passthrough token
+ *     from another OAuth client is rejected (400 client_id_validation_failed).
+ *   • The minted JWT's `sub` is a fresh UUIDv7 — the connection_id. Identity
+ *     of the connection is observable via the `info` claim
+ *     ({ user_id, client_id, scopes, minted_by }).
+ *   • AUTO-subscribe: the connection is always subscribed to
+ *     `user:<client_id>,<user_id>` (the reserved user namespace).
+ *   • The `user:` namespace cannot be shaped manually (channels/subs reject
+ *     it). Group shaping (`group:*`) stays gated by MINT_SHAPING_SCOPE; a
+ *     legacy `body.sub` (mint-on-behalf) is retired with a clear 400.
  */
 app.post('/realtime/token', async (req, res) => {
   const verified = await verifyPublisher(req);
@@ -454,35 +538,62 @@ app.post('/realtime/token', async (req, res) => {
 
   const body = req.body ?? {};
 
-  // ── mint shaping: server-side subscriptions + mint-on-behalf ──────────
-  // Only identities holding MINT_SHAPING_SCOPE (app servers / M2M services
-  // by default — the same trust marker as publishing) may pick the subject
-  // or the channels. User/SPA tokens (browser-direct lane) always mint for
-  // THEMSELVES with the default channel — otherwise any browser could
-  // self-select arbitrary groups.
-  const wantsShaping = body.sub !== undefined || body.channels !== undefined || body.subs !== undefined;
+  // ── 1) passthrough user_token: required, verified, authority-bound ────
+  // The connection's user comes ONLY from this token — never from a caller
+  // chosen body field. Same verification policy as the presenting token.
+  const rawUserToken = typeof body.user_token === 'string' ? body.user_token.trim() : '';
+  if (!rawUserToken) {
+    return res.status(400).json({
+      error: 'user_token_required',
+      detail: 'user_token (the user\'s IdP passthrough access token) is required — the connection user comes only from this token',
+      expected_body: { user_token: '<IdP access token of the user to connect>' },
+    });
+  }
+  const userVerified = await verifyBearerToken(rawUserToken, 'user_token');
+  if (userVerified.status) {
+    return res.status(userVerified.status).json(userVerified.body);
+  }
+  const userPayload = userVerified.payload;
+
+  const userId = typeof userPayload.sub === 'string' ? userPayload.sub : '';
+  if (!userId) {
+    return res.status(403).json({
+      error: 'user_token_no_subject',
+      token: 'user_token',
+      detail: 'user_token must be a USER access token carrying a non-empty "sub" subject — M2M/client-credentials tokens cannot define the connection user',
+    });
+  }
+  const userClientId = getClientId(userPayload);
+
+  // ── 2) authority check: user token bound to the presenting client ─────
+  const presentingClientId = getClientId(payload);
+  if (!userClientId || userClientId !== presentingClientId) {
+    return res.status(400).json({
+      error: 'client_id_validation_failed',
+      detail: `user_token client_id ${JSON.stringify(userClientId || null)} does not match the Authorization token client_id ${JSON.stringify(presentingClientId || null)} — the passthrough user token must be issued to the same OAuth client as the presenting token`,
+      user_token_client_id: userClientId || null,
+      authorization_client_id: presentingClientId || null,
+    });
+  }
+
+  // ── 3) mint shaping (group membership): MINT_SHAPING_SCOPE only ───────
+  // Note: body.sub is retired — the JWT subject is always a fresh uuidv7
+  // (connection_id) and the user identity always comes from user_token.
+  if (body.sub !== undefined) {
+    return res.status(400).json({
+      error: 'sub_not_selectable',
+      detail: 'mint-on-behalf via body.sub is retired: the connection "sub" is always a fresh uuidv7 (connection_id) and the user identity always comes from body.user_token',
+    });
+  }
+  const wantsShaping = body.channels !== undefined || body.subs !== undefined;
   if (wantsShaping && !scopes.has(MINT_SHAPING_SCOPE)) {
     return res.status(403).json({
       error: 'insufficient_scope',
-      detail: `choosing sub/channels/subs on a mint requires scope "${MINT_SHAPING_SCOPE}" (grant it to app-server/service identities only, never to public SPA clients)`,
+      detail: `choosing channels/subs on a mint requires scope "${MINT_SHAPING_SCOPE}" (grant it to app-server/service identities only, never to public SPA clients)`,
       granted_scopes: [...scopes],
     });
   }
 
-  // Subject: the verified identity, or (scoped callers only) an explicit
-  // mint-on-behalf subject — e.g. the app server minting for its user.
-  let subject = payload.sub ?? payload.client_id ?? ''; // never mint anonymous
-  if (body.sub !== undefined) {
-    if (typeof body.sub !== 'string' || !body.sub.trim()) {
-      return res.status(400).json({
-        error: 'invalid_subject',
-        detail: 'sub must be a non-empty string (the Centrifugo user id to mint for)',
-      });
-    }
-    subject = body.sub.trim();
-  }
-
-  // Channels / subs → embedded as server-side subscriptions in the JWT.
   let channels;
   let subs;
   try {
@@ -495,24 +606,37 @@ app.post('/realtime/token', async (req, res) => {
     });
   }
 
-  const clientId = getClientId(payload);
+  // Group client_id scoping: the (authority-verified) user's client_id — the
+  // same value as the presenting token's, so serving/publishing identities
+  // align with the subscriber channels minted here.
   if (channels) {
-    channels = channels.map((ch) => transformGroupChannel(ch, clientId));
+    channels = channels.map((ch) => transformGroupChannel(ch, userClientId));
   }
   if (subs) {
     const rewrittenSubs = {};
     for (const [ch, opts] of Object.entries(subs)) {
-      rewrittenSubs[transformGroupChannel(ch, clientId)] = opts;
+      rewrittenSubs[transformGroupChannel(ch, userClientId)] = opts;
     }
     subs = rewrittenSubs;
   }
+  // validateChannels/validateSubs already refuse user:* — the merged auto-sub
+  // below is the ONLY user-namespace member a mint can ever produce.
+  const userChannelName = userChannel(userClientId, userId);
+  subs = { ...(subs ?? {}), [userChannelName]: (subs?.[userChannelName] ?? {}) };
 
+  // ── 4) mint: subject = fresh uuidv7 (the connection_id) ───────────────
+  const connectionId = uuidv7();
   const minted = mintConnectionJwt({
-    subject,
+    subject: connectionId,
     scopes,
-    maxExp: Number.isFinite(payload.exp) ? payload.exp : Infinity,
+    // the connection never outlives either credential:
+    maxExp: Math.min(
+      Number.isFinite(payload.exp) ? payload.exp : Infinity,
+      Number.isFinite(userPayload.exp) ? userPayload.exp : Infinity
+    ),
     channels,
     subs,
+    info: { user_id: userId, client_id: userClientId },
   });
 
   return res.json({
@@ -520,8 +644,12 @@ app.post('/realtime/token', async (req, res) => {
       url: CENTRIFUGO_PUBLIC_WS_URL,
       token: minted.token,
       channel: CHANNEL,
+      connection_id: connectionId,
+      subject: connectionId, // legacy alias of connection_id
+      user_id: userId,
+      client_id: userClientId,
+      user_channel: userChannelName,
       expires_in: Math.max(0, minted.expiresAt - Math.floor(Date.now() / 1000)),
-      subject,
       ...(channels ? { channels } : {}),
       ...(subs ? { subs } : {}),
     },
@@ -532,6 +660,12 @@ app.post('/realtime/token', async (req, res) => {
       issuer: payload.iss,
       audience: payload.aud,
       granted_scopes: [...scopes],
+      user: {
+        sub: userId,
+        client_id: userClientId,
+        issuer: userPayload.iss ?? null,
+        audience: userPayload.aud ?? null,
+      },
     },
   });
 });
@@ -572,6 +706,29 @@ function effectiveChannels(method, body) {
     default:
       return undefined;
   }
+}
+
+/**
+ * Channel names a relayed call targets via subscribe/unsubscribe — including
+ * commands nested inside a `batch` envelope, so the reserved-namespace guard
+ * covers every manual subscription path (see relayServerApiMethod).
+ */
+function scanManualSubscriptions(method, body, out = []) {
+  if (!body || typeof body !== 'object') return out;
+  if (method === 'batch') {
+    for (const cmd of Array.isArray(body.commands) ? body.commands : []) {
+      if (!cmd || typeof cmd !== 'object') continue;
+      const nestedMethod = Object.keys(cmd)[0];
+      if (!nestedMethod) continue;
+      scanManualSubscriptions(nestedMethod, cmd[nestedMethod], out);
+    }
+    return out;
+  }
+  if ((method === 'subscribe' || method === 'unsubscribe') &&
+      typeof body.channel === 'string') {
+    out.push(body.channel);
+  }
+  return out;
 }
 
 /**
@@ -769,6 +926,21 @@ async function relayServerApiMethod(req, res) {
   const transformedBody = transformChannelsInRequestBody(method, req.body ?? {}, clientId);
   const effective = effectiveChannels(method, transformedBody);
 
+  // The `user` namespace is reserved: its only member (auto per-user group
+  // `user:<client_id>,<user_id>`) is granted by the mint, never managed by
+  // hand. Group rewrite never touches user:* — a post-rewrite check suffices.
+  // scanManualSubscriptions recurses into batch commands so a nested
+  // unsubscribe cannot smuggle a user:* target past this guard.
+  const manualTargets = scanManualSubscriptions(method, transformedBody);
+  const reservedTargets = manualTargets.filter(isUserChannel);
+  if (reservedTargets.length > 0) {
+    return res.status(403).json({
+      error: 'user_namespace_reserved',
+      detail: 'the "user" namespace is reserved for the auto per-user group (user:<client_id>,<user_id>) — it is auto-subscribed at mint and cannot be subscribed/unsubscribed manually',
+      channels: reservedTargets,
+    });
+  }
+
   if (!requireApiKey(res)) return;
 
   let result;
@@ -810,6 +982,13 @@ app.get('/healthz', (_req, res) => {
     mint_shaping_scope: MINT_SHAPING_SCOPE,
     group_client_id_position: GROUP_CLIENT_ID_POSITION,
     group_client_id_delimiter: GROUP_CLIENT_ID_DELIMITER,
+    user_namespace: {
+      reserved: true,
+      auto_subscribe: true,
+      channel_format: `user:<user_token client_id>,<user_token sub>`,
+      mint_shaping: 'rejected (400)',
+      manual_subscribe_relay: 'rejected (403)',
+    },
     connection_ttl: CONNECTION_TTL,
     channel: CHANNEL,
     allowed_client_ids: ALLOWED_CLIENT_IDS,
@@ -827,7 +1006,9 @@ app.listen(PORT, () => {
   console.log(`[proxy]   issuer: ${ISSUER}  audience: ${AUDIENCE.length ? AUDIENCE.join(',') : '(any — not enforced)'}`);
   console.log(`[proxy]   allowed origins: ${ALLOWED_ORIGINS.join(', ')} (server-to-server callers pass without Origin)`);
   console.log(`[proxy]   required scopes: ${REQUIRED_SCOPES.join(' ')}; publish scope: ${PUBLISH_REQUIRED_SCOPE}`);
-  console.log(`[proxy]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"; shaping (sub/channels/subs) requires scope "${MINT_SHAPING_SCOPE}", max ${MINT_MAX_SUBS} subs`);
+  console.log(`[proxy]   minting: HS256, TTL ${CONNECTION_TTL}s, channel "${CHANNEL}"; shaping (channels/subs) requires scope "${MINT_SHAPING_SCOPE}", max ${MINT_MAX_SUBS} subs`);
+  console.log(`[proxy]   mint sub: fresh uuidv7 per mint (connection_id); requires passthrough body user_token (client_id-bound to the Authorization token)`);
+  console.log(`[proxy]   user channel: auto-subscribed user:<client_id>,<user_id> from the user_token; "user" namespace reserved (no manual shaping/subscription)`);
   console.log(`[proxy]   group client_id rewrite: position=${GROUP_CLIENT_ID_POSITION}, delimiter="${GROUP_CLIENT_ID_DELIMITER}" (rewrites group:* channels)`);
   console.log(`[proxy]   Server-API proxy → ${CENTRIFUGO_API_URL} (X-API-Key held here only)`);
   console.log(`[proxy]   proxyable methods: ${ALLOWED_API_METHODS.join(', ')}`);

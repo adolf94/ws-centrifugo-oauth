@@ -120,8 +120,11 @@ services:
   # single holder of both Centrifugo secrets and the only OAuth-aware
   # door in front of them:
   #   • POST /realtime/token  — validates the publisher's OAuth token (JWKS +
-  #     claims/scopes policy) and mints the HS256 connection JWT itself, so
-  #     the app never holds the HMAC secret.
+  #     claims/scopes policy) plus the REQUIRED passthrough body user_token
+  #     (same policy; its client_id must equal the Authorization token's),
+  #     then mints the HS256 connection JWT itself (sub = fresh uuidv7
+  #     connection_id; auto-subscribed user:<client_id>,<user_id>), so the
+  #     app never holds the HMAC secret.
   #   • POST /centrifugo/:method (+ sugar: /publish) — generic proxy for the
   #     Centrifugo v6 HTTP Server API, injecting the one X-API-Key, so the
   #     app never holds the API key either. State-changing methods require

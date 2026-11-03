@@ -56,10 +56,19 @@ Your App Server only requires two environment variables:
 
 When a client application opens a real-time connection, it first calls your backend's negotiate endpoint (`POST /realtime/connection`) to obtain a connection bundle.
 
-To bind the WebSocket connection to a specific **`user_id`** (e.g. database ID, UUID, or username):
-1. Authenticate the user in your backend (via session cookie, Bearer token, etc.) to get their `userId`.
-2. Call `POST {REALTIME_API_URL}/realtime/token` using your backend's service token, passing `{ "sub": userId }`.
-3. Return the connection bundle `{ url, token, channel, expires_in, subject }` to the client.
+The connection's user is established by the **passthrough token**: your backend forwards the user's IdP access token as `user_token` on the mint. The Realtime Service verifies it against the IdP JWKS and derives:
+
+* **`user_id`** = the `sub` claim of the passthrough token (e.g. database ID, UUID, or username);
+* **`client_id`** = the `client_id` (or `azp`) claim of the passthrough token — which **must equal** the `client_id` of the presenting `Authorization` token, otherwise the mint fails with `400 client_id_validation_failed`;
+* **`connection_id`** — a fresh UUIDv7 minted per call; the WebSocket connection is identified by it (the bundle's `connection`/`subject` fields).
+
+So:
+
+1. Authenticate the user and obtain their IdP access token.
+2. Call `POST {REALTIME_API_URL}/realtime/token` with your backend's token in `Authorization` and the user's token in the JSON body as `user_token`.
+3. Return the connection bundle `{ url, token, channel, expires_in, connection_id, user_id, user_channel, … }` to the client.
+
+The connection is **automatically subscribed** to the reserved per-user channel `user:<client_id>,<user_id>` — the client never subscribes by hand, and nothing else can enter that namespace (no mint shaping, no Server-API subscribe).
 
 #### Node.js / Express Example
 
@@ -67,17 +76,16 @@ To bind the WebSocket connection to a specific **`user_id`** (e.g. database ID, 
 // POST /realtime/connection
 app.post('/realtime/connection', requireUserAuth, async (req, res) => {
   try {
-    const currentUserId = req.user.id; // e.g. "user_12345"
-
-    // Request a connection token for this specific user_id
+    // Req.headers.authorization carries the user's IdP access token (or you
+    // may pass an explicit user's token via req.body.user_token).
     const response = await fetch(`${process.env.REALTIME_API_URL}/realtime/token`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${process.env.BACKEND_SERVICE_TOKEN}`, // service token with publish scope
+        'Authorization': req.headers.authorization, // presenting token (same client_id as the user token)
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        sub: currentUserId // Connects as this user_id
+        user_token: req.headers.authorization.slice('Bearer '.length) // the passthrough token (REQUIRED)
       })
     });
 
@@ -87,7 +95,8 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
     }
 
     const data = await response.json();
-    // Return connection bundle to client: { url, token, channel, expires_in, subject }
+    // connection: { url, token, channel, connection_id, subject, user_id,
+    //               client_id, user_channel, expires_in, ... }
     return res.json({ connection: data.connection });
   } catch (error) {
     return res.status(502).json({ error: 'realtime_service_unreachable', detail: String(error) });
@@ -107,15 +116,15 @@ REALTIME_API_URL = os.getenv("REALTIME_API_URL", "https://apis.adolfrey.com/webs
 BACKEND_SERVICE_TOKEN = os.getenv("BACKEND_SERVICE_TOKEN")
 
 @app.post("/realtime/connection")
-async def negotiate_connection(user = Depends(get_authenticated_user)):
-    user_id = str(user.id) # e.g. "user_12345"
+async def negotiate_connection(request: Request, user = Depends(get_authenticated_user)):
+    user_token = get_user_access_token(user)  # the user's IdP access token
 
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.post(
                 f"{REALTIME_API_URL}/realtime/token",
-                headers={"Authorization": f"Bearer {BACKEND_SERVICE_TOKEN}"},
-                json={"sub": user_id}
+                headers={"Authorization": f"Bearer {request.headers['authorization']}"},
+                json={"user_token": user_token},  # REQUIRED passthrough token
             )
         except httpx.RequestError as exc:
             raise HTTPException(status_code=502, detail=f"Realtime service unreachable: {exc}")
@@ -123,8 +132,16 @@ async def negotiate_connection(user = Depends(get_authenticated_user)):
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
 
-    return resp.json()  # Contains {"connection": {"url", "token", "subject": user_id, ...}}
+    return resp.json()  # Contains {"connection": {"url", "token",
+                        #   "connection_id": <uuidv7>, "user_id": <token sub>,
+                        #   "user_channel": "user:<client_id>,<user_id>", ...}}
 ```
+
+> **Note the SignalR mapping**: the token's `sub` is NOT the WebSocket
+> connection's subject — the minted connection JWT's `sub` is a random UUIDv7
+> acting as `connection_id`. Your user identity travels in `user_id`,
+> `client_id` and the auto-subscribed `user_channel` fields, and in the
+> connection JWT's `info` claim.
 
 ---
 
@@ -161,7 +178,7 @@ Authorization: Bearer <backend-service-token>
 Content-Type: application/json
 
 {
-  "sub": "user_12345",
+  "user_token": "<the user's IdP access token>",
   "channels": [
     "group:team-backend",
     "group:project-apollo"
@@ -169,9 +186,11 @@ Content-Type: application/json
 }
 ```
 
-* The user is automatically subscribed as soon as the WebSocket connection opens.
+* The **`user_token` is required** — the connection's user comes only from it (`user_id`/`client_id`, and the auto-subscribed `user:<client_id>,<user_id>` channel). Legacy mint-on-behalf via `"sub"` is no longer accepted.
+* The user is automatically subscribed as soon as the WebSocket connection opens — both to their user channel and to the shaped `group:*` channels.
 * The client **does not** need to call `subscribe()`.
-* Client-side subscription to `group:*` channels is forbidden by default for security, preventing unauthorized users from guessing and joining groups from the browser.
+* Client-side subscription to `group:*` and `user:*` channels is forbidden by default for security, preventing unauthorized users from guessing and joining groups from the browser.
+* Server-API `subscribe`/`unsubscribe` targeting `user:*` is also rejected (`403 user_namespace_reserved`) — the user channel is managed exclusively by the mint.
 
 #### Approach B: Add/Remove Users Dynamically at Runtime (`/subscribe` & `/unsubscribe`)
 
@@ -486,6 +505,8 @@ Clients have **read-only** WebSocket connections. To send a message or perform a
 | Symptom | Cause | Solution |
 |---|---|---|
 | `POST /realtime/token` → `401 Unauthorized` | Invalid or expired OAuth Bearer token | Refresh or re-issue the backend service's OAuth Bearer token before calling negotiate. |
+| `POST /realtime/token` → `400 user_token_required` | The mint body carries no `user_token` | Forward the user's IdP access token in the body: `{ "user_token": "<access token>" }` (§1.2). |
+| `POST /realtime/token` → `400 client_id_validation_failed` | The passthrough `user_token` was issued to a different OAuth client than the `Authorization` token | Mint with tokens belonging to the same client (client_id/azp must match on both), or have your backend present the user's token. |
 | `POST /realtime/token` → `400 invalid_token / "request timed out"` | Transient IdP issue: the Realtime Service could not fetch the JWKS in time to verify your token | Retry with backoff; if persistent, check IdP availability. |
 | `POST /publish` or `/subscribe` → `403 Forbidden` (`insufficient_scope`) | The caller token is missing the publisher scope | Ensure the backend service identity has the `api://ws-server/app:publisher` scope in the IdP (`auth.adolfrey.com`). |
 | `POST /publish` → `502 Bad Gateway` branded error page | A CDN/edge in front of an **outdated wall image** that still mapped upstream failures to 502 | Rebuild/upgrade the Realtime Service deployment — a current wall never emits 502: upstream-failure responses are 4xx/202 with JSON bodies that CDN fronts relay verbatim. |
@@ -495,6 +516,7 @@ Clients have **read-only** WebSocket connections. To send a message or perform a
 | `POST /realtime/token` → `403 Forbidden` (`origin_not_allowed`) | SPA origin is not in the allowed origins list | Contact DevOps to add your frontend domain (e.g. `https://app.yourdomain.com`) to `ALLOWED_ORIGINS`. |
 | WebSocket fails with `permission denied (code 3501)` | Malformed connection frame or protocol mismatch | Ensure you are using the official `centrifuge-js` v5 SDK. |
 | Client calls `subscribe("group:name")` → `permission denied` | `group` namespace forbids client-initiated subscriptions | Assign groups server-side during token minting (§1.4 Approach A) or via server API `/subscribe` (§1.4 Approach B). |
+| `POST /subscribe` → `403 user_namespace_reserved` | The `user` namespace is reserved: `user:<client_id>,<user_id>` is auto-subscribed at mint | Don't manage user channels by hand — every valid connection is subscribed automatically; use `group:*` for membership you control at runtime. |
 | Connection drops after a few minutes and does not reconnect | `getToken` callback missing or throwing an error | Provide the `getToken: negotiate` callback option so the SDK can fetch fresh tokens automatically. |
 
 ---

@@ -481,9 +481,22 @@ app.post('/realtime/connection', requireUserAuth, async (req, res) => {
     let issuerResponse;
     let issuerBody;
     try {
+      // The proxy mint requires the user's IdP token as a body passthrough.
+      // In this SPA lane the Authorization Bearer IS the user's token, so it
+      // defaults to that; a backend that already processed the user can
+      // override with body.user_token.
       issuerResponse = await fetch(PROXY_URL, {
         method: 'POST',
-        headers: { Authorization: req.headers.authorization },
+        headers: {
+          Authorization: req.headers.authorization,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          user_token:
+            typeof req.body?.user_token === 'string' && req.body.user_token.trim() !== ''
+              ? req.body.user_token.trim()
+              : req.headers.authorization.slice(7).trim(),
+        }),
       });
       issuerBody = await issuerResponse.json().catch(() => null);
     } catch (err) {
